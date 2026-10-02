@@ -7,14 +7,12 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -223,7 +221,7 @@ type MirrorSession struct {
 	frameSeq           uint32
 	lastFrameTimestamp uint64
 	lastSlowWriteLog   time.Time
-	firstFrameSent     chan struct{} // closed after first video frame is sent
+	firstFrameSent     chan struct{} // closed after first presentable video frame is sent
 	latePTSReported    bool
 	timestampBias      time.Duration
 	frameClockNow      func() time.Time
@@ -231,8 +229,10 @@ type MirrorSession struct {
 	mediaClock         *mediaClock
 
 	// Audio
-	audioStream *AudioStream
-	noAudio     bool
+	audioStream    *AudioStream
+	firstAudioSent chan struct{} // closed after first audio media packet is sent
+	firstAudioOnce sync.Once
+	noAudio        bool
 }
 
 func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
@@ -363,7 +363,7 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 	if _, err := plist.Unmarshal(responseBody, &response); err != nil {
 		return nil, nil, receivedAt, fmt.Errorf("unmarshal %s SETUP response: %w", phase, err)
 	}
-	dbg("[SETUP] %s response: %+v", phase, response)
+	dbg("[SETUP] %s response: %d bytes, %d fields", phase, len(responseBody), len(response))
 	return response, headers, receivedAt, nil
 }
 
@@ -991,6 +991,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		DataPort:       dataPort,
 		videoCodec:     videoCodec,
 		firstFrameSent: make(chan struct{}),
+		firstAudioSent: make(chan struct{}),
 		noAudio:        cfg.NoAudio,
 		sessionURI:     audioURI,
 		timingConn:     timingConn,
@@ -1024,8 +1025,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		session.chachaCipher = aead
 		dbg("[SETUP] using ChaCha20-Poly1305 (HKDF-SHA512)")
 		dbg("[SETUP] streamConnectionID: %d", videoStreamConnectionID)
-		dbg("[SETUP] IKM (%d bytes):   %02x", len(ikm), ikm)
-		dbg("[SETUP] chacha key:       %02x", chachaKey)
+		dbg("[SETUP] HKDF input=%d bytes, ChaCha20 key=%d bytes", len(ikm), len(chachaKey))
 	} else if encKey != nil {
 		// AES-CTR path: SHA-512-derived key from shk + streamConnectionID.
 		var cipherKey, cipherIV []byte
@@ -1038,10 +1038,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			dbg("[SETUP] using SHA-512 derived keys (AES-CTR)")
 		}
 		dbg("[SETUP] streamConnectionID: %d", videoStreamConnectionID)
-		dbg("[SETUP] shk (raw key):    %02x", encKey)
-		dbg("[SETUP] shiv (raw IV):    %02x", encIV)
-		dbg("[SETUP] cipher key:       %02x", cipherKey)
-		dbg("[SETUP] cipher IV:        %02x", cipherIV)
+		dbg("[SETUP] AES-CTR input key=%d bytes IV=%d bytes; cipher key=%d bytes IV=%d bytes", len(encKey), len(encIV), len(cipherKey), len(cipherIV))
 		mc, err := newMirrorCipher(cipherKey, cipherIV)
 		if err != nil {
 			return nil, fmt.Errorf("stream cipher: %w", err)
@@ -1079,7 +1076,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 					dbg("[DATA-READ] data conn closed: %v", err)
 					return
 				}
-				dbg("[DATA-READ] received %d bytes from Apple TV: %02x", n, buf[:min(n, 64)])
+				dbg("[DATA-READ] received %d bytes from Apple TV", n)
 			}
 		}()
 	}
@@ -1225,7 +1222,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			}
 			avcC := buildAVCCConfig(latestSPS, latestPPS)
 			if frameCount < 20 {
-				dbg("[STREAM] sending codec frame avcC len=%d hdr=%02x", len(avcC), avcC[:min(8, len(avcC))])
+				dbg("[STREAM] sending codec frame avcC len=%d", len(avcC))
 			}
 			if err := s.sendCodecFrame(avcC, packetTimestamp); err != nil {
 				return fmt.Errorf("send codec: %w", err)
@@ -1239,11 +1236,11 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		frameData := vclBuf
 		if s.streamCipher != nil {
 			if frameCount < 5 {
-				dbg("[CRYPTO] frame %d plain[0:20]=%02x", frameCount, vclBuf[:min(20, len(vclBuf))])
+				dbg("[CRYPTO] frame %d plaintext=%d bytes", frameCount, len(vclBuf))
 			}
 			frameData = s.streamCipher(vclBuf)
 			if frameCount < 5 {
-				dbg("[CRYPTO] frame %d  enc[0:20]=%02x", frameCount, frameData[:min(20, len(frameData))])
+				dbg("[CRYPTO] frame %d ciphertext=%d bytes", frameCount, len(frameData))
 			}
 		}
 
@@ -1293,9 +1290,6 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 
 		if frameCount < 20 {
 			fmt.Fprintf(&nalLog, "NAL type=%d len=%d ", nt, len(raw))
-			if len(raw) > 0 {
-				fmt.Fprintf(&nalLog, "hdr=%02x", raw[0])
-			}
 			nalLog.WriteByte('|')
 		}
 
@@ -1411,7 +1405,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			continue
 		}
 		if frameCount == 0 {
-			dbg("[CAPTURE] read %d bytes start=% x", n, buf[:min(n, 16)])
+			dbg("[CAPTURE] read %d bytes", n)
 		}
 
 		nals := parser.Push(buf[:n])
@@ -1820,10 +1814,8 @@ func (s *MirrorSession) sendCodecFrame(payload []byte, ntpTimestamp uint64, code
 	putFloat32LE(header[56:60], float32(s.videoWidth))
 	putFloat32LE(header[60:64], float32(s.videoHeight))
 
-	dbg("[SEND] codec frame: seq=%d payLen=%d hdr[4:6]=%02x%02x ts=%d",
-		s.frameSeq, len(payload), header[4], header[5], ntpTimestamp)
-	dbg("[SEND] codec full header: %02x", header)
-	dbg("[SEND] codec payload: %02x", payload)
+	dbg("[SEND] codec frame: seq=%d payLen=%d type=%d ts=%d",
+		s.frameSeq, len(payload), header[4], ntpTimestamp)
 
 	bufs := net.Buffers{header[:], payload}
 	s.dataMu.Lock()
@@ -1875,11 +1867,8 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 		binary.LittleEndian.PutUint64(nonce[4:], s.chachaNonce)
 		framePayload = s.chachaCipher.Seal(nil, nonce[:], auData, header[:])
 		if s.frameSeq <= 3 {
-			dbg("[CHACHA] nonce=%d nonce_hex=%02x plaintext_len=%d ciphertext_len=%d",
-				s.chachaNonce, nonce[:], len(auData), len(framePayload))
-			dbg("[CHACHA] plaintext[0:min(32)]=%02x", auData[:min(32, len(auData))])
-			dbg("[CHACHA] ciphertext[0:min(32)]=%02x", framePayload[:min(32, len(framePayload))])
-			dbg("[CHACHA] tag=%02x", framePayload[len(framePayload)-16:])
+			dbg("[CHACHA] plaintext_len=%d ciphertext_len=%d tag_len=%d",
+				len(auData), len(framePayload), s.chachaCipher.Overhead())
 		}
 		s.chachaNonce++
 	} else {
@@ -1891,13 +1880,9 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 		keyframeStr = "IDR"
 	}
 
-	if s.frameSeq <= 3 {
-		dbg("[SEND] %s full header: %02x", keyframeStr, header)
-	}
-
 	if s.frameSeq <= 3 || s.frameSeq%300 == 0 {
-		dbg("[SEND] %s frame: seq=%d payLen=%d hdr[4:6]=%02x%02x ts=%d",
-			keyframeStr, s.frameSeq, len(auData), header[4], header[5], networkTimestamp)
+		dbg("[SEND] %s frame: seq=%d payLen=%d ts=%d",
+			keyframeStr, s.frameSeq, len(auData), networkTimestamp)
 	}
 
 	// Use vectored I/O (writev) to send header + payload in a single syscall,
@@ -2047,9 +2032,9 @@ func (s *MirrorSession) feedbackLoop(ctx context.Context) {
 		}
 		var fbResp map[string]interface{}
 		if _, err := plist.Unmarshal(body, &fbResp); err == nil {
-			dbg("[FEEDBACK] response: %+v", fbResp)
+			dbg("[FEEDBACK] plist response: %d bytes, %d fields", len(body), len(fbResp))
 		} else {
-			dbg("[FEEDBACK] response (%d bytes): %02x", len(body), body)
+			dbg("[FEEDBACK] non-plist response: %d bytes", len(body))
 		}
 	}
 
@@ -2210,6 +2195,21 @@ func (s *MirrorSession) AudioStream() *AudioStream {
 	return s.audioStream
 }
 
+// VideoStarted closes after the first presentable video frame is successfully
+// written. Codec configuration, cancellation, and failed writes do not close it.
+// Start StreamFrames before waiting for this signal.
+func (s *MirrorSession) VideoStarted() <-chan struct{} {
+	return s.firstFrameSent
+}
+
+// AudioStarted closes after the first audio media packet is successfully written.
+// Capture startup, prewarming, and clock sync do not close it. It remains open
+// when audio is disabled or streaming fails; callers must also watch stream errors
+// and cancellation. Start both streams before waiting for this signal.
+func (s *MirrorSession) AudioStarted() <-chan struct{} {
+	return s.firstAudioSent
+}
+
 // ntpTimingResponder replies to NTP timing requests from the Apple TV.
 func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 	buf := make([]byte, 128)
@@ -2229,7 +2229,7 @@ func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 			dbg("[NTP] read error: %v", err)
 			return
 		}
-		dbg("[NTP] received %d bytes from %s: %02x", n, addr, buf[:min(n, 32)])
+		dbg("[NTP] received %d bytes from %s", n, addr)
 
 		// 0xd2 is the timing request and 0xd3 its response. A receiver may
 		// answer a sender-initiated probe on this same socket; never answer that
@@ -2552,35 +2552,7 @@ func generateUUID() string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// debugDumpPlist logs a plist map in a stable key order, summarising byte
-// slices by length and hex prefix. Lets the whole SETUP descriptor be diffed
-// between receiver configurations that accept it and ones that reject it.
+// debugDumpPlist reports descriptor size without exposing plist keys or values.
 func debugDumpPlist(label string, m map[string]interface{}) {
-	if !DebugMode() {
-		return
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	dbg("[SETUP] %s (%d keys):", label, len(keys))
-	for _, k := range keys {
-		switch v := m[k].(type) {
-		case []byte:
-			dbg("[SETUP]   %s = <%d bytes> %s", k, len(v), hex.EncodeToString(v[:min(len(v), 16)]))
-		case map[string]interface{}:
-			inner := make([]string, 0, len(v))
-			for ik := range v {
-				inner = append(inner, ik)
-			}
-			sort.Strings(inner)
-			dbg("[SETUP]   %s = map%v", k, inner)
-		case []interface{}:
-			dbg("[SETUP]   %s = list of %d", k, len(v))
-		default:
-			dbg("[SETUP]   %s = %v", k, v)
-		}
-	}
+	dbg("[SETUP] %s: %d fields", label, len(m))
 }

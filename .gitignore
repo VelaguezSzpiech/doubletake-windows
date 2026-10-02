@@ -1,2 +1,5 @@
 /bin
 /artifacts
+/windows-tray/bin/
+/windows-tray/obj/
+/dist/

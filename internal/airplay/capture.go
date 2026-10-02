@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -35,7 +34,7 @@ type CaptureConfig struct {
 	X11WindowID   uint64
 	X11WindowName string
 
-	ShowCursor bool // show the mouse cursor in the captured video (Wayland and X11)
+	ShowCursor bool // show the mouse cursor in the captured video
 
 	RestoreToken     string
 	SaveRestoreToken func(string) error
@@ -82,6 +81,7 @@ const (
 	capturePreparationX11 capturePreparationKind = iota
 	capturePreparationWayland
 	capturePreparationTest
+	capturePreparationWindows
 )
 
 // CapturePreparation performs the potentially interactive part of screen
@@ -111,9 +111,8 @@ type CapturePreparation struct {
 	streamSize [2]int
 }
 
-// StartCapture detects the display server (Wayland or X11) and initiates screen
-// capture accordingly. On Wayland it uses xdg-desktop-portal + PipeWire for
-// capture; on X11 it uses ximagesrc. Both use the selected GStreamer encoder.
+// StartCapture captures the native desktop: D3D11 on Windows, the screencast
+// portal on Wayland, or ximagesrc on X11. All use the shared encoder pipeline.
 func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
 	if cfg.VideoCodec == VideoCodecAuto {
 		return nil, fmt.Errorf("automatic video codec requires PrepareCapture followed by StartWithCodec")
@@ -140,13 +139,9 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, err
 	}
-	kind := capturePreparationX11
-	if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
-		kind = capturePreparationX11
-	} else if os.Getenv("WAYLAND_DISPLAY") != "" {
-		kind = capturePreparationWayland
-	} else if os.Getenv("DISPLAY") == "" {
-		return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
+	kind, err := selectCapturePreparationKind(runtime.GOOS, cfg, os.Getenv("DISPLAY"), os.Getenv("WAYLAND_DISPLAY"))
+	if err != nil {
+		return nil, err
 	}
 
 	validationCfg := cfg
@@ -180,6 +175,14 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	}
 	if !preparation.timestampedOutput {
 		log.Printf("[CAPTURE] warning: GStreamer RTP/ONVIF timestamp elements are unavailable; video will use output-time timestamps")
+	}
+	if kind == capturePreparationWindows {
+		for _, element := range []string{"d3d11screencapturesrc", "d3d11download"} {
+			if !hasGstElement(element) {
+				return nil, fmt.Errorf("Windows capture requires GStreamer %s (Bad Plug-ins)", element)
+			}
+		}
+		return preparation, nil
 	}
 	if kind == capturePreparationX11 {
 		if err := exec.Command("gst-inspect-1.0", "ximagesrc").Run(); err != nil {
@@ -359,6 +362,8 @@ func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context, 
 		return startPreparedWaylandCapture(ctx, cfg, encoder, nodeID, pwFd, dbusConn, streamSize, timestampedOutput)
 	case capturePreparationX11:
 		return startPreparedX11Capture(ctx, cfg, encoder, timestampedOutput)
+	case capturePreparationWindows:
+		return startPreparedWindowsCapture(ctx, cfg, encoder, timestampedOutput)
 	case capturePreparationTest:
 		return startPreparedTestCapture(ctx, cfg, encoder, timestampedOutput)
 	default:
@@ -417,7 +422,8 @@ func (p *CapturePreparation) Close() {
 }
 
 func hasGstElement(name string) bool {
-	return exec.Command("gst-inspect-1.0", name).Run() == nil
+	wait, err := startGStreamerCommand(exec.Command("gst-inspect-1.0", name))
+	return err == nil && <-wait == nil
 }
 
 func supportsTimestampedVideoOutput(codec VideoCodec) bool {
@@ -670,35 +676,6 @@ func automaticHEVCProfile(hwaccel string, fps int) (bool, time.Duration) {
 func automaticHEVCAvailable(hwaccel string) bool {
 	ok, _ := automaticHEVCProfile(hwaccel, 30)
 	return ok
-}
-
-// startGStreamerCommand starts a capture child whose lifetime cannot outlive
-// doubletake. Linux delivers Pdeathsig when the creating OS thread exits, not
-// strictly when the whole process exits, so the supervising goroutine keeps
-// that thread locked until Wait completes.
-func startGStreamerCommand(cmd *exec.Cmd) (<-chan error, error) {
-	started := make(chan error, 1)
-	waitResult := make(chan error, 1)
-
-	go func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-		err := cmd.Start()
-		started <- err
-		if err != nil {
-			close(waitResult)
-			return
-		}
-		waitResult <- cmd.Wait()
-		close(waitResult)
-	}()
-
-	if err := <-started; err != nil {
-		return nil, err
-	}
-	return waitResult, nil
 }
 
 // gstStage is one GStreamer element (or caps filter) followed by its arguments.
@@ -1053,9 +1030,7 @@ func (sc *ScreenCapture) Stop() {
 		sc.dbusConn.Close()
 	}
 
-	if sc.cmd != nil && sc.cmd.Process != nil {
-		_ = sc.cmd.Process.Signal(os.Interrupt)
-	}
+	interruptCaptureCommand(sc.cmd)
 
 	select {
 	case <-sc.waitCh:

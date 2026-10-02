@@ -229,11 +229,12 @@ func (i *ReceiverInfo) MaxVideoSize() (int, int) {
 // HTTPStatusError is returned when a receiver responds with a non-2xx RTSP/HTTP status.
 type HTTPStatusError struct {
 	StatusCode int
-	Body       []byte
+	// Body is retained for protocol handling but omitted from printable diagnostics.
+	Body []byte
 }
 
 func (e *HTTPStatusError) Error() string {
-	return fmt.Sprintf("HTTP %d (body: %s)", e.StatusCode, string(e.Body))
+	return fmt.Sprintf("HTTP %d (body: %d bytes)", e.StatusCode, len(e.Body))
 }
 
 // ErrCredentialsRequired identifies a Digest challenge that the client cannot
@@ -459,27 +460,14 @@ func (c *AirPlayClient) getInfoWithTimeout(timeout time.Duration) (*ReceiverInfo
 		return nil, err
 	}
 
-	// Log the full /info response for debugging audio format support
 	var fullInfo map[string]interface{}
-	if _, err2 := plist.Unmarshal(resp, &fullInfo); err2 == nil {
-		dbg("[INFO] full /info response keys: %v", func() []string {
-			keys := make([]string, 0, len(fullInfo))
-			for k := range fullInfo {
-				keys = append(keys, k)
-			}
-			return keys
-		}())
-		for _, key := range []string{"audioFormats", "audioLatencies", "displays", "features", "featuresEx", "statusFlags", "initialVolume", "volumeControlType", "keepAliveSendStatsAsBody", "supportedAudioFormatsExtended", "supportedFormats", "PTPInfo"} {
-			if v, ok := fullInfo[key]; ok {
-				dbg("[INFO] %s: %+v", key, v)
-			}
-		}
-	}
+	_, _ = plist.Unmarshal(resp, &fullInfo)
 
 	var info ReceiverInfo
 	if _, err := plist.Unmarshal(resp, &info); err != nil {
 		return nil, fmt.Errorf("decode info plist: %w", err)
 	}
+	dbg("[INFO] features=0x%x statusFlags=0x%x displays=%d extendedAudioFormats=%d", info.Features, info.StatusFlags, len(info.Displays), len(info.SupportedAudioFormatsExtended))
 	info.Server = responseHeaders["server"]
 	_, info.hasPTPInfo = fullInfo["PTPInfo"]
 
@@ -931,7 +919,7 @@ func (c *AirPlayClient) readHTTPResponseWithTimeout(timeout time.Duration) ([]by
 	defer c.conn.SetReadDeadline(time.Time{})
 
 	if c.encrypted {
-		dbg("[READ] reading encrypted response (readKey=%s, readNonce=%d)", hex.EncodeToString(c.encReadKey[:8]), c.encReadNonce)
+		dbg("[READ] reading encrypted response (readNonce=%d)", c.encReadNonce)
 		return c.readEncryptedHTTPResponse()
 	}
 	dbg("[READ] reading plaintext response")
@@ -944,7 +932,7 @@ func (c *AirPlayClient) readPlaintextHTTPResponse() ([]byte, map[string]string, 
 	oneByte := make([]byte, 1)
 	for {
 		if _, err := io.ReadFull(c.conn, oneByte); err != nil {
-			return nil, nil, fmt.Errorf("read response header (got %d bytes so far: %q): %w", headerBuf.Len(), headerBuf.String(), err)
+			return nil, nil, fmt.Errorf("read response header (got %d bytes so far): %w", headerBuf.Len(), err)
 		}
 		headerBuf.Write(oneByte)
 
@@ -958,7 +946,6 @@ func (c *AirPlayClient) readPlaintextHTTPResponse() ([]byte, map[string]string, 
 	}
 
 	header := headerBuf.String()
-	dbg("[READ] plaintext response header:\n%s", header)
 	statusCode, contentLength, headers := parseHTTPHeader(header)
 	dbg("[READ] status=%d content-length=%d", statusCode, contentLength)
 	if err := validateContentLength(contentLength); err != nil {
@@ -977,7 +964,7 @@ func (c *AirPlayClient) readPlaintextHTTPResponse() ([]byte, map[string]string, 
 				return nil, headers, fmt.Errorf("read error response body (%d bytes): %w", contentLength, err)
 			}
 		}
-		dbg("[READ] error response body (%d bytes): %s", len(errBody), hex.EncodeToString(errBody))
+		dbg("[READ] error response body: %d bytes", len(errBody))
 		return nil, headers, &HTTPStatusError{StatusCode: statusCode, Body: errBody}
 	}
 
@@ -1006,9 +993,6 @@ func (c *AirPlayClient) readEncryptedHTTPResponse() ([]byte, map[string]string, 
 		frame, err := c.readEncryptedFrame()
 		if err != nil {
 			dbg("[ENC-READ] frame %d read error (decrypted so far=%d bytes): %v", frameCount, len(decrypted), err)
-			if len(decrypted) > 0 {
-				dbg("[ENC-READ] partial decrypted data hex: %s", hex.EncodeToString(decrypted))
-			}
 			return nil, nil, fmt.Errorf("read encrypted response frame %d: %w", frameCount, err)
 		}
 		frameCount++
@@ -1029,7 +1013,6 @@ func (c *AirPlayClient) readEncryptedHTTPResponse() ([]byte, map[string]string, 
 	header := string(decrypted[:headerEnd+4])
 	remaining := decrypted[headerEnd+4:]
 
-	dbg("[ENC-READ] decrypted response header:\n%s", header)
 	statusCode, contentLength, headers := parseHTTPHeader(header)
 	dbg("[ENC-READ] status=%d content-length=%d remaining=%d", statusCode, contentLength, len(remaining))
 	if err := validateContentLength(contentLength); err != nil {
@@ -1050,7 +1033,7 @@ func (c *AirPlayClient) readEncryptedHTTPResponse() ([]byte, map[string]string, 
 		if len(remaining) > contentLength && contentLength > 0 {
 			remaining = remaining[:contentLength]
 		}
-		dbg("[ENC-READ] error response body (%d bytes): %s", len(remaining), hex.EncodeToString(remaining))
+		dbg("[ENC-READ] error response body: %d bytes", len(remaining))
 		return nil, headers, &HTTPStatusError{StatusCode: statusCode, Body: remaining}
 	}
 
@@ -1120,8 +1103,7 @@ func (c *AirPlayClient) encrypt(data []byte) []byte {
 		aad := make([]byte, 2)
 		binary.LittleEndian.PutUint16(aad, uint16(len(chunk)))
 
-		dbg("[ENC-WRITE] chunk %d: %d bytes, writeNonce=%d, aad=%s",
-			chunkNum, len(chunk), c.encWriteNonce, hex.EncodeToString(aad))
+		dbg("[ENC-WRITE] chunk %d: %d bytes, writeNonce=%d", chunkNum, len(chunk), c.encWriteNonce)
 		c.encWriteNonce++
 
 		encrypted := c.encCipher.Seal(nil, nonce, chunk, aad)
@@ -1142,15 +1124,14 @@ func (c *AirPlayClient) readEncryptedFrame() ([]byte, error) {
 		return nil, fmt.Errorf("read frame length: %w (timeout or connection closed)", err)
 	}
 	plaintextLen := int(binary.LittleEndian.Uint16(lengthBuf))
-	dbg("[ENC-FRAME] length prefix: %s (plaintext len=%d, will read %d bytes)",
-		hex.EncodeToString(lengthBuf), plaintextLen, plaintextLen+16)
+	dbg("[ENC-FRAME] plaintext len=%d, will read %d bytes", plaintextLen, plaintextLen+16)
 
 	if plaintextLen == 0 || plaintextLen > 16384 {
 		dbg("[ENC-FRAME] WARNING: suspicious frame length %d — raw bytes on wire may not be encrypted frames", plaintextLen)
-		// Peek at a few more bytes for debugging
+		// Preserve the existing invalid-frame read without exposing raw wire data.
 		peek := make([]byte, 32)
 		n, _ := c.conn.Read(peek)
-		dbg("[ENC-FRAME] next %d bytes on wire: %s", n, hex.EncodeToString(peek[:n]))
+		dbg("[ENC-FRAME] read %d bytes after invalid frame length", n)
 		return nil, fmt.Errorf("suspicious frame length %d (expected 1-1024)", plaintextLen)
 	}
 
@@ -1168,14 +1149,12 @@ func (c *AirPlayClient) readEncryptedFrame() ([]byte, error) {
 
 	nonce := make([]byte, 12)
 	binary.LittleEndian.PutUint64(nonce[4:], c.encReadNonce)
-	dbg("[ENC-FRAME] decrypting with nonce=%d key=%s... aad=%s",
-		c.encReadNonce, hex.EncodeToString(c.encReadKey[:8]), hex.EncodeToString(lengthBuf))
+	dbg("[ENC-FRAME] decrypting with ChaCha20-Poly1305 nonce=%d, plaintext len=%d", c.encReadNonce, plaintextLen)
 	c.encReadNonce++
 
 	plaintext, err := readCipher.Open(nil, nonce, ciphertext, lengthBuf)
 	if err != nil {
-		dbg("[ENC-FRAME] DECRYPT FAILED: nonce=%d ciphertext[:32]=%s",
-			c.encReadNonce-1, hex.EncodeToString(ciphertext[:min(32, len(ciphertext))]))
+		dbg("[ENC-FRAME] DECRYPT FAILED: nonce=%d ciphertext=%d bytes", c.encReadNonce-1, len(ciphertext))
 		return nil, fmt.Errorf("decrypt frame (nonce=%d, len=%d): %w", c.encReadNonce-1, plaintextLen, err)
 	}
 

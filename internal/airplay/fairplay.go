@@ -50,15 +50,12 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	}
 
 	dbg("[FP] received m2 (%d bytes)", len(m2))
-	dbg("[FP] m2 first 32: %02x", m2[:min(32, len(m2))])
 
 	// Phase 2: Compute m3 and send it to the receiver.
 	m3, err := fpsap.exchangeM3(m2)
 	if err != nil {
 		return fmt.Errorf("FPSAPExchange: %w", err)
 	}
-
-	dbg("[FP] m3 (%d bytes) first 32: %02x", len(m3), m3[:min(32, len(m3))])
 
 	dbg("[FP] posting m3 (%d bytes) to /fp-setup", len(m3))
 	m4, err := c.httpRequest("POST", "/fp-setup", "application/octet-stream", m3,
@@ -75,7 +72,6 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 		return fmt.Errorf("FPSAP m4: %w", err)
 	}
 	dbg("[FP] received m4 (%d bytes)", len(m4))
-	dbg("[FP] m4 payload (%d bytes): %02x", len(m4)-12, m4[12:])
 
 	// Generate and store IV for stream encryption
 	var iv [16]byte
@@ -100,13 +96,9 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 		return fmt.Errorf("wrap FairPlay audio key: %w", err)
 	}
 	c.FpEkey = ekey[:]
-	dbg("[FP] ekey chunk1 [16:32]: %02x", ekey[16:32])
-	dbg("[FP] ekey key length [32:36]: %d", 16)
-	dbg("[FP] ekey chunk2 [56:72]: %02x", ekey[56:72])
+	dbg("[FP] wrapped AES key: %d bytes, ekey record: %d bytes", len(fpAesKey), len(ekey))
 
 	c.fpAesKey = fpAesKey[:]
-	dbg("[FP] wrapped fpAesKey: %02x", fpAesKey[:])
-	dbg("[FP] m3 first 32 bytes: %02x", c.fpM3[:min(32, len(c.fpM3))])
 
 	mixPairVerifyKey := c.PairKeys != nil && c.PairKeys.MixFairPlayKey
 	finalKey := deriveStreamMasterKey(c.fpAesKey, sharedSecret(c.PairKeys), mixPairVerifyKey)
@@ -119,9 +111,7 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	c.fpKey = finalKey
 
 	dbg("[FP] FairPlay SAP handshake complete!")
-	dbg("[FP] fpAesKey (raw): %02x", c.fpAesKey)
-	dbg("[FP] fpKey (hashed): %02x", c.fpKey)
-	dbg("[FP] stream IV:      %02x", iv[:])
+	dbg("[FP] stream key: %d bytes, IV: %d bytes", len(c.fpKey), len(iv))
 
 	return nil
 }

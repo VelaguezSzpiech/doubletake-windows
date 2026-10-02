@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -278,7 +277,7 @@ func (c *AirPlayClient) performTransientSetupAndVerify(ctx context.Context) erro
 	}
 
 	// Raw pair-setup succeeded — store server's Ed25519 public key and use raw pair-verify
-	dbg("[PAIR] raw pair-setup OK, server Ed25519 pub: %02x", serverPub[:8])
+	dbg("[PAIR] raw pair-setup OK, server Ed25519 public key: %d bytes", len(serverPub))
 	return c.completeRawSetupAndVerify(ctx, serverPub)
 }
 
@@ -780,9 +779,7 @@ func (c *AirPlayClient) hapPairVerify(ctx context.Context) error {
 	c.PairKeys.WriteKey = c.encWriteKey
 	c.PairKeys.ReadKey = c.encReadKey
 
-	dbg("[PAIR-VERIFY] shared secret: %s...", hex.EncodeToString(shared[:16]))
-	dbg("[PAIR-VERIFY] writeKey: %s...", hex.EncodeToString(c.encWriteKey[:8]))
-	dbg("[PAIR-VERIFY] readKey:  %s...", hex.EncodeToString(c.encReadKey[:8]))
+	dbg("[PAIR-VERIFY] derived ChaCha20-Poly1305 control keys (shared secret=%d bytes, write key=%d bytes, read key=%d bytes)", len(shared), len(c.encWriteKey), len(c.encReadKey))
 
 	writeCipher, err := chacha20poly1305.New(c.encWriteKey)
 	if err != nil {

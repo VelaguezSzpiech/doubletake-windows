@@ -68,8 +68,7 @@ func newCaptureDecrypter(aesKeyHex string, scid uint64) (*mirrorCipher, error) {
 	}
 
 	cipherKey, cipherIV := deriveVideoKeys(aesKey, int64(scid))
-	dbg("[REPLAY] original capture cipher key: %02x", cipherKey)
-	dbg("[REPLAY] original capture cipher IV:  %02x", cipherIV)
+	dbg("[REPLAY] original capture cipher: AES-CTR, key=%d bytes IV=%d bytes", len(cipherKey), len(cipherIV))
 
 	block, err := aes.NewCipher(cipherKey)
 	if err != nil {
@@ -159,8 +158,6 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 			copy(frame[128:], f.payload)
 
 			dbg("[REPLAY] sending codec frame %d: payLen=%d ts=%d", i, len(f.payload), newTS)
-			dbg("[REPLAY] codec header: %02x", header[:16])
-			dbg("[REPLAY] codec payload: %02x", f.payload)
 
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -184,11 +181,7 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 			plaintext := decrypter.EncryptFrame(f.payload) // XOR is symmetric
 
 			if sentFrames < 5 {
-				dispLen := len(plaintext)
-				if dispLen > 32 {
-					dispLen = 32
-				}
-				dbg("[REPLAY] frame %d decrypted[0:%d]: %02x", i, dispLen, plaintext[:dispLen])
+				dbg("[REPLAY] frame %d decrypted: %d bytes", i, len(plaintext))
 			}
 
 			// Re-encrypt with this session's cipher
@@ -208,9 +201,8 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 			copy(frame[128:], ciphertext)
 
 			if sentFrames < 5 {
-				dbg("[REPLAY] sending VCL frame %d: payLen=%d ts=%d hdr[4:8]=%02x",
-					i, len(ciphertext), newTS, header[4:8])
-				dbg("[REPLAY] VCL header: %02x", header[:64])
+				dbg("[REPLAY] sending VCL frame %d: payLen=%d ts=%d encrypted=%v",
+					i, len(ciphertext), newTS, s.streamCipher != nil)
 			}
 
 			s.dataMu.Lock()

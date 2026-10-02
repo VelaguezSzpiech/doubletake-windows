@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"reflect"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -28,8 +26,9 @@ func TestCapturePreparationCloseReleasesUnstartedResources(t *testing.T) {
 	preparation.Close()
 	preparation.Close() // cleanup must remain idempotent
 
-	if _, err := portalFD.Stat(); !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("portal FD after Close: %v, want os.ErrClosed", err)
+	var data [1]byte
+	if n, err := portalFD.Read(data[:]); n != 0 || !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("portal FD read after Close = (%d, %v), want (0, os.ErrClosed)", n, err)
 	}
 	if preparation.pwFd != nil {
 		t.Fatal("closed preparation retained its portal FD")
@@ -54,8 +53,9 @@ func TestCapturePreparationFailedStartReleasesTransferredResources(t *testing.T)
 	if _, err := preparation.Start(1920, 1080); err == nil || !strings.Contains(err.Error(), "unknown encoder") {
 		t.Fatalf("failed Start error = %v, want deterministic encoder validation error", err)
 	}
-	if _, err := portalFD.Stat(); !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("transferred portal FD after failed Start: %v, want os.ErrClosed", err)
+	var data [1]byte
+	if n, err := portalFD.Read(data[:]); n != 0 || !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("transferred portal FD read after failed Start = (%d, %v), want (0, os.ErrClosed)", n, err)
 	}
 	if preparation.pwFd != nil {
 		t.Fatal("failed Start retained its transferred portal FD")
@@ -221,20 +221,6 @@ func TestMeasureVideoCaptureLatencyCancellationInterruptsRead(t *testing.T) {
 	}
 	if !capture.stopped {
 		t.Fatal("canceled measurement left its capture reader active")
-	}
-}
-
-func TestStartGStreamerCommandSetsParentDeathSignal(t *testing.T) {
-	cmd := exec.Command("true")
-	waitResult, err := startGStreamerCommand(cmd)
-	if err != nil {
-		t.Fatalf("startGStreamerCommand: %v", err)
-	}
-	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Pdeathsig != syscall.SIGKILL {
-		t.Fatalf("Pdeathsig = %v, want SIGKILL", cmd.SysProcAttr)
-	}
-	if err := <-waitResult; err != nil {
-		t.Fatalf("wait for supervised command: %v", err)
 	}
 }
 

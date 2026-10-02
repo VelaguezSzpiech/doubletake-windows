@@ -1,0 +1,25 @@
+{
+  "gstreamer": {
+    "version": "1.28.6",
+    "url": "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.6/msvc/gstreamer-1.0-msvc-x86_64-1.28.6.exe",
+    "fileName": "gstreamer-1.0-msvc-x86_64-1.28.6.exe",
+    "sha256": "059251444d1267b486eba390b18d25fed87e10315e72f757ec6c7e912fa746b5",
+    "requiredFiles": [
+      "bin/gst-launch-1.0.exe",
+      "bin/gst-inspect-1.0.exe",
+      "bin/gstreamer-1.0-0.dll",
+      "lib/gstreamer-1.0/gstcoreelements.dll",
+      "lib/gstreamer-1.0/gstd3d11.dll",
+      "lib/gstreamer-1.0/gstnvcodec.dll",
+      "lib/gstreamer-1.0/gstwasapi2.dll",
+      "lib/gstreamer-1.0/gstvideoconvertscale.dll",
+      "lib/gstreamer-1.0/gstvideoparsersbad.dll",
+      "lib/gstreamer-1.0/gstopenh264.dll",
+      "lib/gstreamer-1.0/gstaudioconvert.dll",
+      "lib/gstreamer-1.0/gstaudioresample.dll",
+      "lib/gstreamer-1.0/gstrtp.dll",
+      "lib/gstreamer-1.0/gstrtpmanager.dll",
+      "lib/gstreamer-1.0/gstrtponvif.dll"
+    ]
+  }
+}

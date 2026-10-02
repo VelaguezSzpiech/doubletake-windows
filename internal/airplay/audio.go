@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -191,7 +192,16 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440", "is-live=true",
 			fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
 		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=%d)", codecSPF)
-	} else if exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil {
+	} else if runtime.GOOS == "windows" {
+		if !hasGstElement("wasapi2src") {
+			cancel()
+			return nil, fmt.Errorf("Windows loopback audio requires GStreamer wasapi2src (Bad Plug-ins)")
+		}
+		// loopback opens the default render endpoint, never the microphone.
+		// low-latency is documented safe for both render-loopback and capture.
+		srcArgs = []string{"wasapi2src", "loopback=true", "low-latency=true"}
+		dbg("[AUDIO] using WASAPI default render-device loopback")
+	} else if hasGstElement("pulsesrc") {
 		monitor := detectPulseMonitor()
 		if monitor == "" {
 			cancel()
@@ -199,7 +209,7 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		}
 		srcArgs = []string{"pulsesrc", fmt.Sprintf("device=%s", monitor)}
 		dbg("[AUDIO] using pulsesrc device=%s", monitor)
-	} else if exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil {
+	} else if hasGstElement("pipewiresrc") {
 		srcArgs = []string{"pipewiresrc"}
 		dbg("[AUDIO] using pipewiresrc")
 	} else {
@@ -773,9 +783,12 @@ func (as *AudioStream) sendAudioPacketWithSeqAndNonce(payload []byte, rtpTime ui
 		// before a later packet can expose this sequence as missing.
 		as.rememberAudioPacket(seq, packet)
 	}
-	_, err := as.conn.WriteTo(packet, as.remoteAddr)
+	n, err := as.conn.WriteTo(packet, as.remoteAddr)
 	if err != nil {
 		return usedNonce, err
+	}
+	if n != len(packet) {
+		return usedNonce, io.ErrShortWrite
 	}
 
 	// RTP timestamps wrap at 32 bits. A signed modular comparison keeps an old
@@ -1367,6 +1380,13 @@ videoReady:
 			}
 			retransmitBuf[retransmitIdx] = audioFrame{payload: payload, rtpTime: frameRTP, seq: frameSeq, nonce: nonce}
 			retransmitIdx = (retransmitIdx + 1) % retransmitDepth
+		}
+
+		// A captured frame or a TimeAnnounce is not media delivery. Publish
+		// readiness only after the first full media packet has been written.
+		// Older internal session literals may omit the readiness channel.
+		if frameCount == 1 && s.firstAudioSent != nil {
+			s.firstAudioOnce.Do(func() { close(s.firstAudioSent) })
 		}
 
 		frameSeq++

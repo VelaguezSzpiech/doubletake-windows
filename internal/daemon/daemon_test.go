@@ -51,7 +51,17 @@ func TestRunRejectsSecondDaemonWithoutRemovingLiveSocket(t *testing.T) {
 }
 
 func TestRunRejectsLiveDaemonThatPredatesInstanceLock(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")
+	// Keep the path short enough for AF_UNIX, without t.TempDir's test-name prefix.
+	dir, err := os.MkdirTemp("", "dt-")
+	if err != nil {
+		t.Fatalf("create socket directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove socket directory: %v", err)
+		}
+	})
+	socketPath := filepath.Join(dir, "doubletake.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatalf("listen as old daemon: %v", err)
