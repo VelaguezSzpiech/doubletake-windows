@@ -57,13 +57,34 @@ type videoSelection struct {
 // selectVideo chooses one concrete codec and canvas from the final receiver
 // snapshot. Apple's sender treats SupportsScreenMultiCodec (feature 42), a
 // maximum above 1080p, and local HEVC-4K support as independent gates. Auto
-// follows that shape; explicit codec requests remain deterministic.
-func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable bool) (videoSelection, error) {
+// follows that shape unless the user explicitly requests the bounded Full HD
+// path. An explicit request is not evidence of receiver resolution support.
+func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable, fullHD bool) (videoSelection, error) {
 	if requested == "" {
 		requested = VideoCodecH264
 	}
 	if err := ValidateVideoCodec(string(requested)); err != nil {
 		return videoSelection{}, err
+	}
+	if fullHD {
+		codec := requested
+		if codec == VideoCodecAuto {
+			// Full HD does not need the automatic HEVC/4K path or its extra lead.
+			codec = VideoCodecH264
+		}
+		if !i.supportsVideoCodec(codec) {
+			return videoSelection{}, fmt.Errorf("receiver does not advertise AirPlay feature 42 (SupportsScreenMultiCodec) required for HEVC")
+		}
+		width, height := 1920, 1080
+		reason := "explicit Full HD request; receiver maximum omitted"
+		if i != nil && len(i.Displays) > 0 {
+			display := i.Displays[0]
+			if display.WidthPixelsMax > 0 && display.HeightPixelsMax > 0 {
+				width, height = fitVideoSize(width, height, int(display.WidthPixelsMax), int(display.HeightPixelsMax))
+				reason = "explicit Full HD request bounded by receiver maximum"
+			}
+		}
+		return videoSelection{codec: codec, width: width, height: height, reason: reason}, nil
 	}
 
 	switch requested {

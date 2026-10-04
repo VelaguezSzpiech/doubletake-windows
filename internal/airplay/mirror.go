@@ -637,7 +637,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			return nil
 		}
 		videoPrepared = true
-		selection, selectionErr := info.selectVideo(cfg.VideoCodec, cfg.AutomaticHEVCAvailable)
+		selection, selectionErr := info.selectVideo(cfg.VideoCodec, cfg.AutomaticHEVCAvailable, cfg.FullHD)
 		if selectionErr != nil {
 			return selectionErr
 		}
@@ -647,7 +647,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			// latencyMax has been accepted. Keep the descriptor and TimeAnnounce
 			// coherent by retaining the nominal H.264 path for this session rather
 			// than selecting a calibrated HEVC clock too late.
-			selection, selectionErr = info.selectVideo(VideoCodecH264, false)
+			selection, selectionErr = info.selectVideo(VideoCodecH264, false, cfg.FullHD)
 			if selectionErr != nil {
 				return selectionErr
 			}

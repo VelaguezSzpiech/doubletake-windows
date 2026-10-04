@@ -76,7 +76,9 @@ func runCLI() (resultErr error) {
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
 	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, openh264, none (x264/x265)")
+	nvencDevice := flag.String("nvenc-device", "", "Explicit GStreamer NVIDIA device index (empty = automatic); never fall back to a different GPU")
 	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses capability-gated hardware HEVC for high-resolution receivers)")
+	fullHD := flag.Bool("full-hd", false, "Request a canvas up to 1920x1080, respecting explicit receiver size limits (sender request when dimensions are unadvertised)")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
@@ -154,7 +156,9 @@ func runCLI() (resultErr error) {
 			PortMin:     portMin,
 			PortMax:     portMax,
 			HWAccel:     *hwaccel,
+			NVENCDevice: *nvencDevice,
 			VideoCodec:  airplay.VideoCodec(*videoCodec),
+			FullHD:      *fullHD,
 			Debug:       *debug,
 			TestMode:    *testMode,
 			NoEncrypt:   *noEncrypt,
@@ -426,6 +430,7 @@ func runCLI() (resultErr error) {
 		FPS:        *fps,
 		Bitrate:    *bitrate,
 		VideoCodec: airplay.VideoCodec(*videoCodec),
+		FullHD:     *fullHD,
 		NoEncrypt:  *noEncrypt,
 		DirectKey:  *directKey,
 		NoAudio:    *noAudio,
@@ -440,6 +445,7 @@ func runCLI() (resultErr error) {
 		FPS:           *fps,
 		Bitrate:       *bitrate,
 		HWAccel:       *hwaccel,
+		NVENCDevice:   *nvencDevice,
 		VideoCodec:    airplay.VideoCodec(*videoCodec),
 		X11WindowID:   xid,
 		X11WindowName: *x11WindowName,

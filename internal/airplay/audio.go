@@ -783,7 +783,7 @@ func (as *AudioStream) sendAudioPacketWithSeqAndNonce(payload []byte, rtpTime ui
 		// before a later packet can expose this sequence as missing.
 		as.rememberAudioPacket(seq, packet)
 	}
-	n, err := as.conn.WriteTo(packet, as.remoteAddr)
+	n, err := writeAudioDatagram(as.conn, packet, as.remoteAddr)
 	if err != nil {
 		return usedNonce, err
 	}
@@ -869,7 +869,7 @@ func (as *AudioStream) handleAudioControlPacket(packet []byte, addr net.Addr) (h
 			response[1] = audioRetransmitResponsePayloadType
 			binary.BigEndian.PutUint16(response[2:4], request.requestSeq)
 			binary.BigEndian.PutUint16(response[4:6], seq)
-			if _, writeErr := as.ctrlConn.WriteTo(response, addr); writeErr != nil {
+			if _, writeErr := writeAudioDatagram(as.ctrlConn, response, addr); writeErr != nil {
 				return true, resent, writeErr
 			}
 			dbg("[AUDIO] retransmit request id=%d first=%d count=%d: resent=%d, sequence %d expired",
@@ -882,7 +882,7 @@ func (as *AudioStream) handleAudioControlPacket(packet []byte, addr net.Addr) (h
 		response[1] = audioRetransmitResponsePayloadType
 		binary.BigEndian.PutUint16(response[2:4], request.requestSeq)
 		copy(response[4:], original)
-		if _, writeErr := as.ctrlConn.WriteTo(response, addr); writeErr != nil {
+		if _, writeErr := writeAudioDatagram(as.ctrlConn, response, addr); writeErr != nil {
 			return true, resent, writeErr
 		}
 		resent++
@@ -979,7 +979,7 @@ func (as *AudioStream) sendSyncPacketAt(timingProtocol string, networkTime, time
 
 	dbg("[AUDIO-SYNC] first=%t rtp=%d latency=%d network=0x%016x timeline=0x%016x",
 		isFirst, rtpNow, latencySamples, networkTime, timelineID)
-	_, err := as.ctrlConn.WriteTo(packet, as.ctrlAddr)
+	_, err := writeAudioDatagram(as.ctrlConn, packet, as.ctrlAddr)
 	return err
 }
 

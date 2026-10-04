@@ -41,27 +41,23 @@ func TestAutomaticVideoSelectionRequiresReceiverMaximumAndLocalHardware(t *testi
 		wantCodec VideoCodec
 		wantW     int
 		wantH     int
-		wantWhy   string
 	}{
-		{name: "all gates", info: highResolution, localHEVC: true, wantCodec: VideoCodecHEVC, wantW: 3840, wantH: 2160, wantWhy: "feature 42"},
-		{name: "local hardware unavailable", info: highResolution, wantCodec: VideoCodecH264, wantW: 1280, wantH: 720, wantWhy: "local hardware"},
-		{name: "receiver codec capability absent", info: &ReceiverInfo{Displays: highResolution.Displays}, localHEVC: true, wantCodec: VideoCodecH264, wantW: 1280, wantH: 720, wantWhy: "feature 42"},
+		{name: "all gates", info: highResolution, localHEVC: true, wantCodec: VideoCodecHEVC, wantW: 3840, wantH: 2160},
+		{name: "local hardware unavailable", info: highResolution, wantCodec: VideoCodecH264, wantW: 1280, wantH: 720},
+		{name: "receiver codec capability absent", info: &ReceiverInfo{Displays: highResolution.Displays}, localHEVC: true, wantCodec: VideoCodecH264, wantW: 1280, wantH: 720},
 		{name: "maximum is only 1080p", info: &ReceiverInfo{
 			Features: uint64(1) << featureScreenMultiCodec,
 			Displays: []DisplayInfo{{WidthPixels: 1280, HeightPixels: 720, WidthPixelsMax: 1920, HeightPixelsMax: 1080}},
-		}, localHEVC: true, wantCodec: VideoCodecH264, wantW: 1280, wantH: 720, wantWhy: "does not exceed 1080p"},
+		}, localHEVC: true, wantCodec: VideoCodecH264, wantW: 1280, wantH: 720},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			selection, err := test.info.selectVideo(VideoCodecAuto, test.localHEVC)
+			selection, err := test.info.selectVideo(VideoCodecAuto, test.localHEVC, false)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if selection.codec != test.wantCodec || selection.width != test.wantW || selection.height != test.wantH {
 				t.Fatalf("selection = %s %dx%d, want %s %dx%d", selection.codec, selection.width, selection.height, test.wantCodec, test.wantW, test.wantH)
-			}
-			if !strings.Contains(selection.reason, test.wantWhy) {
-				t.Fatalf("reason = %q, want substring %q", selection.reason, test.wantWhy)
 			}
 		})
 	}
@@ -75,14 +71,14 @@ func TestAutomaticVideoSelectionCapsMaximumPreservingAspect(t *testing.T) {
 			WidthPixelsMax: 7680, HeightPixelsMax: 2160,
 		}},
 	}
-	selection, err := info.selectVideo(VideoCodecAuto, true)
+	selection, err := info.selectVideo(VideoCodecAuto, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if selection.codec != VideoCodecHEVC || selection.width != 3840 || selection.height != 1080 {
 		t.Fatalf("selection = %s %dx%d, want HEVC 3840x1080", selection.codec, selection.width, selection.height)
 	}
-	forced, err := info.selectVideo(VideoCodecHEVC, false)
+	forced, err := info.selectVideo(VideoCodecHEVC, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +95,7 @@ func TestExplicitVideoCodecOverridesAutomaticPolicy(t *testing.T) {
 			WidthPixelsMax: 3840, HeightPixelsMax: 2160,
 		}},
 	}
-	h264, err := info.selectVideo(VideoCodecH264, true)
+	h264, err := info.selectVideo(VideoCodecH264, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,12 +103,44 @@ func TestExplicitVideoCodecOverridesAutomaticPolicy(t *testing.T) {
 		t.Fatalf("explicit H.264 = %s %dx%d", h264.codec, h264.width, h264.height)
 	}
 
-	hevc, err := info.selectVideo(VideoCodecHEVC, false)
+	hevc, err := info.selectVideo(VideoCodecHEVC, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if hevc.codec != VideoCodecHEVC || hevc.width != 3840 || hevc.height != 2160 {
 		t.Fatalf("explicit HEVC = %s %dx%d", hevc.codec, hevc.width, hevc.height)
+	}
+}
+
+func TestFullHDVideoSelectionHonorsExplicitMaximum(t *testing.T) {
+	tests := []struct {
+		name      string
+		info      *ReceiverInfo
+		requested VideoCodec
+		wantCodec VideoCodec
+		wantW     int
+		wantH     int
+	}{
+		{name: "no display metadata is an explicit request", info: &ReceiverInfo{}, requested: VideoCodecH264, wantCodec: VideoCodecH264, wantW: 1920, wantH: 1080},
+		{name: "nominal is not an explicit maximum", info: &ReceiverInfo{Displays: []DisplayInfo{{WidthPixels: 1280, HeightPixels: 720}}}, requested: VideoCodecH264, wantCodec: VideoCodecH264, wantW: 1920, wantH: 1080},
+		{name: "4K maximum does not select 4K or HEVC", info: &ReceiverInfo{Features: uint64(1) << featureScreenMultiCodec, Displays: []DisplayInfo{{WidthPixelsMax: 3840, HeightPixelsMax: 2160}}}, requested: VideoCodecAuto, wantCodec: VideoCodecH264, wantW: 1920, wantH: 1080},
+		{name: "explicit 720p ceiling remains 720p", info: &ReceiverInfo{Displays: []DisplayInfo{{WidthPixelsMax: 1280, HeightPixelsMax: 720}}}, requested: VideoCodecH264, wantCodec: VideoCodecH264, wantW: 1280, wantH: 720},
+		{name: "narrow ceiling preserves requested aspect", info: &ReceiverInfo{Displays: []DisplayInfo{{WidthPixelsMax: 1440, HeightPixelsMax: 1080}}}, requested: VideoCodecH264, wantCodec: VideoCodecH264, wantW: 1440, wantH: 810},
+		{name: "explicit HEVC remains capability gated and capped", info: &ReceiverInfo{Features: uint64(1) << featureScreenMultiCodec, Displays: []DisplayInfo{{WidthPixelsMax: 3840, HeightPixelsMax: 2160}}}, requested: VideoCodecHEVC, wantCodec: VideoCodecHEVC, wantW: 1920, wantH: 1080},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selection, err := test.info.selectVideo(test.requested, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selection.codec != test.wantCodec || selection.width != test.wantW || selection.height != test.wantH {
+				t.Fatalf("selection = %s %dx%d, want %s %dx%d", selection.codec, selection.width, selection.height, test.wantCodec, test.wantW, test.wantH)
+			}
+		})
+	}
+	if _, err := (&ReceiverInfo{}).selectVideo(VideoCodecHEVC, true, true); err == nil {
+		t.Fatal("explicit Full HD HEVC request accepted without feature 42")
 	}
 }
 

@@ -28,9 +28,9 @@ func selectCapturePreparationKind(goos string, cfg CaptureConfig, display, wayla
 
 // startPreparedWindowsCapture uses the DXGI Desktop Duplication source from
 // GStreamer's d3d11 plugin. monitor-index=-1 selects the primary monitor, not
-// the entire virtual desktop. Download once to the system-memory format used
-// by the existing software and NVENC encoders; preserve source PTS through the
-// shared RTP/ONVIF suffix rather than stamping frames at pipe-read time.
+// the entire virtual desktop. Keep textures on the GPU through conversion and
+// scaling when supported; otherwise download for the existing CPU preprocessing.
+// Preserve source PTS through the shared RTP/ONVIF suffix in either case.
 func startPreparedWindowsCapture(ctx context.Context, cfg CaptureConfig, encoder encoderResult, timestampedOutput bool) (*ScreenCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
 	fps := cfg.FPS
@@ -43,9 +43,11 @@ func startPreparedWindowsCapture(ctx context.Context, cfg CaptureConfig, encoder
 	}
 	beforeConvert := []gstStage{
 		{fmt.Sprintf("video/x-raw(memory:D3D11Memory),framerate=%d/1", fps)},
-		{"d3d11download"},
-		lowLatencyVideoQueueStage(),
 	}
+	if !encoder.d3d11Convert {
+		beforeConvert = append(beforeConvert, gstStage{"d3d11download"})
+	}
+	beforeConvert = append(beforeConvert, lowLatencyVideoQueueStage())
 	args := buildGstVideoPipeline(source, beforeConvert, nil, encoder, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
 	dbg("[CAPTURE] gst-launch-1.0 (windows) %s", strings.Join(args, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", args...)

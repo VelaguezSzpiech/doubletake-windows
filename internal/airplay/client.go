@@ -1180,6 +1180,7 @@ type StreamConfig struct {
 	FPS                    int
 	Bitrate                int           // Video bitrate in kbps
 	VideoCodec             VideoCodec    // empty/h264, auto, or capability-gated hevc
+	FullHD                 bool          // explicit up-to-1080p request, respecting advertised size ceilings
 	AutomaticHEVCAvailable bool          // capture preflight found the hardware HEVC-4K path
 	MeasuredVideoLatency   time.Duration // measured minimum lead for the local HEVC capture path
 	NoEncrypt              bool          // Disable encryption for debugging

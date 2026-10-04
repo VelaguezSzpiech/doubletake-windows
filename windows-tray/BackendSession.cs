@@ -33,7 +33,17 @@ internal sealed class BackendSession : IDisposable
     {
         var start = StartInfo("-ui", "-target", receiver.IP, "-port", receiver.Port.ToString(),
             "-device-json", JsonSerializer.Serialize(receiver), "-cred-backend", "keyring", "-creds", Path.Combine(StateDirectory, "credentials.json"),
-            "-video-codec", "h264", "-fps", "30");
+            "-video-codec", "h264", "-full-hd", "-fps", "60", "-bitrate", "10000");
+        // A tray started by an already-running Explorer can inherit an old environment.
+        string? nvencDevice = Environment.GetEnvironmentVariable("DOUBLETAKE_NVENC_DEVICE", EnvironmentVariableTarget.User)
+            ?? Environment.GetEnvironmentVariable("DOUBLETAKE_NVENC_DEVICE");
+        if (!string.IsNullOrWhiteSpace(nvencDevice))
+        {
+            start.ArgumentList.Add("-hwaccel");
+            start.ArgumentList.Add("nvenc");
+            start.ArgumentList.Add("-nvenc-device");
+            start.ArgumentList.Add(nvencDevice.Trim());
+        }
         if (forcePair) start.ArgumentList.Add("-pair");
         job = new ProcessJob();
         process = new Process { StartInfo = start };

@@ -46,7 +46,11 @@ The connected state means the backend sent initial video and audio media; it is 
 
 Only the primary monitor is captured; a window on another monitor will not appear. Protected/DRM content may be blank. Locking, remote desktop, monitor/GPU changes or a driver reset can affect Desktop Duplication. Return to an interactive desktop and disconnect/reconnect after changing display output. Check the graphics driver and required GStreamer capture elements if this persists.
 
-The initial Windows hardware check was H.264 720p30 on one AppleTV11,1 setup with NVENC. A 4K TV does not imply a 4K mirroring stream. Receiver negotiation can select a different canvas; no forced 4K/HDR or universal compatibility is promised.
+The initial Windows check was H.264 720p30. A later AppleTV11,1 session used H.264 1920×1080 at 60 fps with a GTX 1650; after reconnect, visible video and audible audio were user-confirmed. This is not a long-duration stability result. Long-run audio degradation followed by `WSAENOBUFS` and a TCP abort remains unresolved; short healthy recovery is not a long soak, and capture-probe startup can stall.
+
+The tray requests Full HD H.264/60 fps at 10 Mbps, respecting explicit smaller receiver ceilings. Optional explicit GPU selection is available; a persisted per-user setting takes precedence over an inherited environment value. For example, set the per-user environment variable `DOUBLETAKE_NVENC_DEVICE` to the verified device index (replace `INDEX`): `$env:DOUBLETAKE_NVENC_DEVICE = "INDEX"` is only a process-scoped PowerShell example, not persisted. Persist it in Windows user environment settings with value `INDEX`, then restart DoubleTake. An explicit GPU choice fails rather than silently falling back. These source features are not in the unchanged public v1.0.0 installer; build from source (see [Unreleased changelog](../CHANGELOG.md)).
+
+The 75/85 ms scheduled timing values are not measured end-to-end latency. A joint 40 ms test was reverted after audio corruption. Higher picture quality and GPU encoding do not guarantee gaming-grade latency.
 
 ## No sound, wrong sound or output changed
 
@@ -56,6 +60,8 @@ The initial Windows hardware check was H.264 720p30 on one AppleTV11,1 setup wit
 4. Look for `wasapi2src` or audio-format/capture errors in the local log. The tray requires both video and audio startup; missing audio support is not reported as a successful full-sharing session.
 
 DoubleTake captures playback PCM through WASAPI loopback. It does **not** create a separate Windows output device, capture your microphone, or provide Dolby Atmos/DTS passthrough. The physical Windows verification showed audio transport sends, but speaker audibility was not separately confirmed. A receiver that only advertises unsupported AAC-ELD audio needs a separately enabled optional build; the default Windows release does not bundle FDK AAC.
+
+On Windows, UDP error `WSAENOBUFS` (10055, “insufficient buffer space” or “queue was full”) triggers at most three retries of the exact same encrypted datagram, at 2 ms intervals. Persistent buffer pressure or any permanent error still fails the send/session; retries do not guarantee delivery or resolve long-run audio degradation. A later session recovered briefly, but long-run degradation followed by `WSAENOBUFS` and TCP abort remains unresolved; this was not a long soak. Non-Windows behavior is unchanged. Check local logs and Windows resource/network events if it repeats.
 
 ## GStreamer or encoder errors
 

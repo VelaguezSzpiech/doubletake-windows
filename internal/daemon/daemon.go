@@ -95,7 +95,9 @@ type Config struct {
 	PortMin     int // inclusive local UDP port bound; zero with PortMax means ephemeral
 	PortMax     int // inclusive local UDP port bound; zero with PortMin means ephemeral
 	HWAccel     string
+	NVENCDevice string
 	VideoCodec  airplay.VideoCodec
+	FullHD      bool
 	Debug       bool
 	TestMode    bool
 	NoEncrypt   bool
@@ -110,6 +112,7 @@ func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
 		FPS:        d.cfg.FPS,
 		Bitrate:    d.cfg.Bitrate,
 		VideoCodec: d.cfg.VideoCodec,
+		FullHD:     d.cfg.FullHD,
 		NoEncrypt:  d.cfg.NoEncrypt,
 		DirectKey:  d.cfg.DirectKey,
 		NoAudio:    d.cfg.NoAudio,
@@ -1315,6 +1318,7 @@ func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
+		NVENCDevice:  d.cfg.NVENCDevice,
 		VideoCodec:   d.cfg.VideoCodec,
 		ShowCursor:   d.cfg.ShowCursor,
 		RestoreToken: restoreToken,
@@ -1476,6 +1480,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
+		NVENCDevice:  d.cfg.NVENCDevice,
 		VideoCodec:   codec,
 		MaxWidth:     key.maxWidth,
 		MaxHeight:    key.maxHeight,

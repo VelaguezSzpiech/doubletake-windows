@@ -20,14 +20,15 @@ import (
 
 // CaptureConfig holds screen capture settings.
 type CaptureConfig struct {
-	FPS        int
-	Bitrate    int        // Video bitrate in kbps (0 = auto)
-	HWAccel    string     // "auto", "nvenc", "vaapi", "openh264", or "none"
-	VideoCodec VideoCodec // empty/h264, auto (resolved before Start), or hevc
+	FPS         int
+	Bitrate     int        // Video bitrate in kbps (0 = auto)
+	HWAccel     string     // "auto", "nvenc", "vaapi", "openh264", or "none"
+	VideoCodec  VideoCodec // empty/h264, auto (resolved before Start), or hevc
+	NVENCDevice string     // empty = auto; Windows H.264 NVENC device index when explicitly selected
 
-	// MaxWidth/MaxHeight select the encoded canvas advertised by the receiver.
-	// The captured image is aspect-fitted into it. Zero leaves the capture at
-	// its native size.
+	// MaxWidth/MaxHeight select the negotiated or explicitly requested encoded
+	// canvas. The captured image is aspect-fitted into it. Zero leaves the capture
+	// at its native size.
 	MaxWidth  int
 	MaxHeight int
 
@@ -159,7 +160,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 		kind:              kind,
 		timestampedOutput: supportsTimestampedVideoOutput(normalizeVideoCodec(validationCfg.VideoCodec)),
 	}
-	if cfg.VideoCodec == VideoCodecAuto {
+	if cfg.VideoCodec == VideoCodecAuto && cfg.NVENCDevice == "" {
 		preparation.automaticHEVCAvail, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
 	} else if cfg.VideoCodec == VideoCodecHEVC {
 		// Forced NVENC HEVC uses the same local pipeline and benefits from the
@@ -233,7 +234,7 @@ func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePrepara
 		kind:              capturePreparationTest,
 		timestampedOutput: supportsTimestampedVideoOutput(normalizeVideoCodec(validationCfg.VideoCodec)),
 	}
-	if cfg.VideoCodec == VideoCodecAuto {
+	if cfg.VideoCodec == VideoCodecAuto && cfg.NVENCDevice == "" {
 		preparation.automaticHEVCAvail, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
 	} else if cfg.VideoCodec == VideoCodecHEVC {
 		_, preparation.measuredVideoLatency = automaticHEVCProfile(cfg.HWAccel, cfg.FPS)
@@ -685,10 +686,12 @@ type gstStage []string
 
 // encoderResult holds the selected encoder stage and its input requirements.
 type encoderResult struct {
-	parts       gstStage
-	needsVulkan bool   // encoder needs vulkanupload immediately before it
-	rawFormat   string // system-memory format produced by videoconvert
-	codec       VideoCodec
+	parts         gstStage
+	needsVulkan   bool   // encoder needs vulkanupload immediately before it
+	d3d11Convert  bool   // Windows desktop keeps conversion and scaling on the capture GPU
+	d3d11Download bool   // transfer postscale NV12 through system memory to an explicit encoder GPU
+	rawFormat     string // required encoder input format
+	codec         VideoCodec
 }
 
 func frameRateStage(fps int) gstStage {
@@ -770,10 +773,23 @@ func buildGstVideoPipeline(source gstStage, beforeConvert, afterScale []gstStage
 		args = appendGstStage(args, stage)
 	}
 
-	args = appendGstStage(args, gstStage{"videoconvert"})
-	args = appendGstStage(args, gstStage{fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat)})
-	for _, stage := range receiverScaleStages(maxWidth, maxHeight) {
-		args = appendGstStage(args, stage)
+	if encoder.d3d11Convert && len(source) > 0 && source[0] == "d3d11screencapturesrc" {
+		args = appendGstStage(args, gstStage{"d3d11convert", "add-borders=true"})
+		caps := fmt.Sprintf("video/x-raw(memory:D3D11Memory),format=%s", encoder.rawFormat)
+		if width, height := maxWidth&^1, maxHeight&^1; width > 0 && height > 0 {
+			caps += fmt.Sprintf(",width=%d,height=%d,pixel-aspect-ratio=1/1", width, height)
+		}
+		args = appendGstStage(args, gstStage{caps})
+		if encoder.d3d11Download {
+			args = appendGstStage(args, gstStage{"d3d11download"})
+			args = appendGstStage(args, gstStage{fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat)})
+		}
+	} else {
+		args = appendGstStage(args, gstStage{"videoconvert"})
+		args = appendGstStage(args, gstStage{fmt.Sprintf("video/x-raw,format=%s", encoder.rawFormat)})
+		for _, stage := range receiverScaleStages(maxWidth, maxHeight) {
+			args = appendGstStage(args, stage)
+		}
 	}
 	for _, stage := range afterScale {
 		args = appendGstStage(args, stage)
@@ -1142,6 +1158,44 @@ func detectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool) 
 	return selectGstEncoderWithProbe(cfg, hasElement, true)
 }
 
+func selectGstNVENCDevice(cfg CaptureConfig, hasElement func(string) bool, announce bool, hwaccel string, bitrate, keyframeInterval int) (encoderResult, error) {
+	for _, digit := range cfg.NVENCDevice {
+		if digit < '0' || digit > '9' {
+			return encoderResult{}, fmt.Errorf("-nvenc-device requires a non-negative decimal device index")
+		}
+	}
+	device, err := strconv.Atoi(cfg.NVENCDevice)
+	if err != nil || device < 0 {
+		return encoderResult{}, fmt.Errorf("-nvenc-device requires a non-negative device index")
+	}
+	if runtime.GOOS != "windows" || normalizeVideoCodec(cfg.VideoCodec) != VideoCodecH264 {
+		return encoderResult{}, fmt.Errorf("-nvenc-device requires Windows H.264 capture")
+	}
+	if hwaccel != "auto" && hwaccel != "nvenc" {
+		return encoderResult{}, fmt.Errorf("-nvenc-device is incompatible with -hwaccel %s", hwaccel)
+	}
+	element := "nvd3d11h264enc"
+	if device > 0 {
+		element = fmt.Sprintf("nvd3d11h264device%denc", device)
+	}
+	if !hasElement(element) {
+		return encoderResult{}, fmt.Errorf("-nvenc-device %d requires GStreamer %s; refusing to select another GPU", device, element)
+	}
+	gpuConvert := hasElement("d3d11convert")
+	if announce {
+		log.Printf("[CAPTURE] using NVENC device %d (%s), GPU preprocessing=%t, system-memory transfer to selected GPU", device, element, gpuConvert)
+	}
+	return encoderResult{
+		rawFormat: "NV12", codec: VideoCodecH264,
+		d3d11Convert: gpuConvert, d3d11Download: gpuConvert,
+		parts: gstStage{
+			element, fmt.Sprintf("bitrate=%d", bitrate), fmt.Sprintf("gop-size=%d", keyframeInterval),
+			"bframes=0", "rc-lookahead=0", "rc-mode=cbr",
+			"preset=p4", "tune=low-latency", "zerolatency=true",
+		},
+	}, nil
+}
+
 func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, announce bool) (encoderResult, error) {
 	if !announce && cfg.Bitrate <= 0 {
 		// Preparation only validates element availability. The real automatic
@@ -1161,6 +1215,9 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 	if err := ValidateHWAccel(hwaccel); err != nil {
 		return encoderResult{}, err
 	}
+	if cfg.NVENCDevice != "" {
+		return selectGstNVENCDevice(cfg, hasElement, announce, hwaccel, bitrate, keyframeInterval)
+	}
 	if normalizeVideoCodec(cfg.VideoCodec) == VideoCodecHEVC {
 		return selectGstHEVCEncoder(cfg, hasElement, announce, hwaccel, bitrate, keyframeInterval)
 	}
@@ -1173,6 +1230,18 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 		label   string
 		result  encoderResult
 	}{
+		{
+			method:  "nvenc",
+			element: "nvd3d11h264enc",
+			label:   "NVENC hardware encoding with GPU conversion/scaling (nvd3d11h264enc)",
+			result: encoderResult{rawFormat: "NV12", codec: VideoCodecH264, d3d11Convert: true, parts: gstStage{
+				"nvd3d11h264enc",
+				fmt.Sprintf("bitrate=%d", bitrate),
+				fmt.Sprintf("gop-size=%d", keyframeInterval),
+				"bframes=0", "rc-lookahead=0", "rc-mode=cbr",
+				"preset=p4", "tune=low-latency", "zerolatency=true",
+			}},
+		},
 		{
 			method:  "nvenc",
 			element: "vulkanh264enc",
@@ -1252,7 +1321,13 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 		if hwaccel != "auto" && hwaccel != candidate.method {
 			continue
 		}
+		if candidate.result.d3d11Convert && runtime.GOOS != "windows" {
+			continue
+		}
 		if hasElement(candidate.element) {
+			if candidate.result.d3d11Convert && !hasElement("d3d11convert") {
+				continue
+			}
 			if announce {
 				log.Printf("[CAPTURE] using %s", candidate.label)
 			}
@@ -1264,7 +1339,7 @@ func selectGstEncoderWithProbe(cfg CaptureConfig, hasElement func(string) bool, 
 		return encoderResult{}, fmt.Errorf("no supported GStreamer H.264 encoder is available")
 	}
 	if hwaccel == "nvenc" {
-		return encoderResult{}, fmt.Errorf("-hwaccel nvenc requires GStreamer element vulkanh264enc or nvh264enc; neither is available")
+		return encoderResult{}, fmt.Errorf("-hwaccel nvenc requires GStreamer nvd3d11h264enc with d3d11convert (Windows), vulkanh264enc, or nvh264enc; none is available")
 	}
 	for _, candidate := range candidates {
 		if candidate.method == hwaccel {

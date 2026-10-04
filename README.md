@@ -25,22 +25,26 @@ Click outside the flyout or press **Escape** to hide it without stopping sharing
 - The **64-bit MSVC GStreamer runtime**, including desktop capture, WASAPI loopback, an H.264 encoder and the required parser/RTP plugins. Setup detects normal user/machine installations or installs the pinned runtime when needed.
 - **Primary monitor only**: this is desktop mirroring, not a multi-monitor picker, per-window capture or an extended display.
 - Audio captures the **default Windows playback device** using WASAPI loopback. It does not create a separate Windows audio output device, capture the microphone, or pass through Dolby Atmos/DTS bitstreams. Select the desired playback device before connecting; an output-device change may require disconnecting and reconnecting.
-- The tray requests **H.264 at 30 fps**. The initial tested Windows profile was **720p30**; the receiver negotiates the actual canvas, so other receivers may differ. This is **not a promise of 4K, HDR, surround sound or universal receiver compatibility**. NVENC is used when available through the existing encoder selection; software encoding is also possible.
+- The tray requests **Full HD H.264 at 60 fps and 10 Mbps**. Explicit receiver size ceilings are respected; when dimensions are omitted, 1080p is a sender request rather than an advertised capability. Windows prefers native D3D11 NVENC with GPU conversion/scaling. Set `DOUBLETAKE_NVENC_DEVICE` to an explicitly verified GStreamer NVIDIA device index to pin an encoder; explicit selection fails rather than silently switching GPU. This is not a promise of universal receiver compatibility, 4K or HDR.
 - Protected content, display/driver changes and network conditions can affect capture or playback. Reconnect after an output change if sharing stops or audio remains on the previous device.
 
 ## Verification and compatibility
 
-The Windows port has had local Go tests and native capture smoke checks, saved-pairing and tray-interaction checks, and user-observed primary-desktop mirroring on **AppleTV11,1 (Apple TV 4K, second generation)**. That session negotiated H.264 1280×720 at 30 fps using NVENC. Backend media readiness and logs showed video and audio sends; **speaker audibility was not separately confirmed**. This is one tested setup, not a certification of every model or fault-free audio/video under every condition.
+Windows source verification includes the full Go suite across all packages and a .NET build with zero warnings or errors. New tests cover explicit GPU/canvas selection and bounded retries that preserve the exact encrypted packet. This does not claim a fresh Linux execution.
 
-The upstream project reports testing AppleTV3,2; AppleTV11,1; AppleTV14,1 (including one setup with a first-generation HomePod); Mac17,2; Mac16,10; Roku Streaming Stick 4K (3820R2); Samsung TU8300; and Hisense 55A6QU. It reports Xiaomi AFTBR92D74 as non-functional ([upstream issue #4](https://github.com/omarroth/doubletake/issues/4)). **Those upstream reports are not additional Windows verification.** The in-repository test receiver is a protocol/traffic sink, not proof that real hardware decodes or displays the stream. Likewise, the flyout's connected state confirms initial video/audio sends, not the TV's rendering or sound output.
+On AppleTV11,1 (Apple TV 4K, second generation), a later session negotiated H.264 1920×1080 at 60 fps using a GTX 1650; after reconnect, the user confirmed visible video and audible audio. This is one setup, not a compatibility guarantee or long-duration stability result. Long-run audio degradation followed by `WSAENOBUFS` and a TCP abort remains unresolved; short healthy recovery is not a long soak. Capture-probe startup can stall. The 75/85 ms scheduled timing values are not measured end-to-end latency; a joint 40 ms test was reverted after audio corruption.
+
+The public Windows v1.0.0 installer is unchanged and does not include these current-source features. To use them, build from source; see the [Unreleased changelog](CHANGELOG.md).
 
 ## Documentation
 
 - [Building Windows, testing, and upstream Linux reference](docs/building.md)
 - [Architecture, data flow, privacy and security](docs/architecture.md)
 - [Logs and troubleshooting: installation, VPN, pairing, audio and capture](docs/troubleshooting.md)
+- [Unreleased changes](CHANGELOG.md)
 - [Third-party notices and source links](THIRD_PARTY_NOTICES.md)
 - [Installer implementation notes](packaging/windows/README.md)
+
 
 ## Privacy and security
 

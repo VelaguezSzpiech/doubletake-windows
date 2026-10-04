@@ -85,6 +85,12 @@ forced HEVC).
 Only \fBauto\fR tries fallback encoders. An explicit method fails if its
 required GStreamer encoder is unavailable. The default is \fBauto\fR.
 .TP
+.B \-nvenc-device \fIINDEX\fR
+Explicit GStreamer NVIDIA device index for Windows H.264 encoding.
+The default is automatic. An explicit index fails if unavailable or incompatible;
+it never silently selects another GPU. Inspect the encoder adapter identity before
+choosing an index; GStreamer and other tools need not enumerate GPUs identically.
+.TP
 .B \-video-codec \fICODEC\fR
 Screen codec: capability-driven \fBauto\fR (default), forced \fBh264\fR, or
 forced \fBhevc\fR. Automatic HEVC requires receiver feature 42, a session-time
@@ -94,6 +100,11 @@ The automatic hardware preflight measures sustained 4K capture-to-access-unit
 latency and increases both presentation leads by the same bounded margin when
 needed, preserving their relative synchronization.
 Main10 output does not fabricate HDR metadata for an SDR capture source.
+.TP
+.B \-full-hd
+Request a canvas up to 1920x1080, respecting explicit receiver size ceilings.
+When dimensions are unadvertised, this is an explicit sender request, not proof
+of receiver support. Automatic codec selection stays H.264 in this mode.
 .TP
 .B \-debug
 Enable verbose protocol logging

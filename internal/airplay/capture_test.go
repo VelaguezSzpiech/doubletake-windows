@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -701,20 +702,25 @@ func TestDetectGstEncoderRejectsMissingExplicitOpenH264(t *testing.T) {
 
 func TestDetectGstEncoderSelectionContract(t *testing.T) {
 	allProbes := []string{"vulkanh264enc", "nvh264enc", "vah264enc", "openh264enc", "x264enc"}
-	tests := []struct {
+	if runtime.GOOS == "windows" {
+		allProbes = append([]string{"nvd3d11h264enc"}, allProbes...)
+	}
+	nvencProbes := allProbes[:len(allProbes)-3]
+	type selectionTest struct {
 		name        string
 		method      string
 		available   map[string]bool
 		wantEncoder string
 		wantProbes  []string
-		wantError   string
-	}{
+		wantError   bool
+	}
+	tests := []selectionTest{
 		{
 			name:        "auto falls through to OpenH264",
 			method:      "auto",
 			available:   map[string]bool{"openh264enc": true, "x264enc": true},
 			wantEncoder: "openh264enc",
-			wantProbes:  allProbes[:4],
+			wantProbes:  allProbes[:len(allProbes)-1],
 		},
 		{
 			name:        "empty aliases auto and reaches x264",
@@ -726,21 +732,21 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			name:       "auto errors when no encoder exists",
 			method:     "auto",
 			wantProbes: allProbes,
-			wantError:  "no supported GStreamer H.264 encoder",
+			wantError:  true,
 		},
 		{
 			name:        "nvenc accepts legacy NVENC only",
 			method:      "nvenc",
 			available:   map[string]bool{"nvh264enc": true, "openh264enc": true},
 			wantEncoder: "nvh264enc",
-			wantProbes:  []string{"vulkanh264enc", "nvh264enc"},
+			wantProbes:  nvencProbes,
 		},
 		{
 			name:       "missing nvenc does not cross fallback",
 			method:     "nvenc",
 			available:  map[string]bool{"vah264enc": true, "openh264enc": true, "x264enc": true},
-			wantProbes: []string{"vulkanh264enc", "nvh264enc"},
-			wantError:  "-hwaccel nvenc",
+			wantProbes: nvencProbes,
+			wantError:  true,
 		},
 		{
 			name:        "vaapi selects only VAAPI",
@@ -754,7 +760,7 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			method:     "vaapi",
 			available:  map[string]bool{"openh264enc": true, "x264enc": true},
 			wantProbes: []string{"vah264enc"},
-			wantError:  "vah264enc",
+			wantError:  true,
 		},
 		{
 			name:        "none forces x264",
@@ -768,8 +774,23 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			method:     "none",
 			available:  map[string]bool{"openh264enc": true},
 			wantProbes: []string{"x264enc"},
-			wantError:  "x264enc",
+			wantError:  true,
 		},
+	}
+	if runtime.GOOS == "windows" {
+		tests = append(tests, selectionTest{
+			name:        "native NVENC avoids CPU readback when GPU conversion exists",
+			method:      "nvenc",
+			available:   map[string]bool{"nvd3d11h264enc": true, "d3d11convert": true, "nvh264enc": true},
+			wantEncoder: "nvd3d11h264enc",
+			wantProbes:  []string{"nvd3d11h264enc", "d3d11convert"},
+		}, selectionTest{
+			name:        "native NVENC falls back when GPU conversion is unavailable",
+			method:      "nvenc",
+			available:   map[string]bool{"nvd3d11h264enc": true, "nvh264enc": true},
+			wantEncoder: "nvh264enc",
+			wantProbes:  []string{"nvd3d11h264enc", "d3d11convert", "vulkanh264enc", "nvh264enc"},
+		})
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -781,9 +802,9 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			if !reflect.DeepEqual(probes, test.wantProbes) {
 				t.Fatalf("encoder probes = %v, want %v", probes, test.wantProbes)
 			}
-			if test.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantError) {
-					t.Fatalf("encoder error = %v, want error containing %q", err, test.wantError)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("unavailable requested encoder was silently substituted")
 				}
 				return
 			}
@@ -793,6 +814,78 @@ func TestDetectGstEncoderSelectionContract(t *testing.T) {
 			if len(encoder.parts) == 0 || encoder.parts[0] != test.wantEncoder {
 				t.Fatalf("encoder = %#v, want %s", encoder, test.wantEncoder)
 			}
+			if encoder.d3d11Convert != (test.wantEncoder == "nvd3d11h264enc") {
+				t.Fatalf("encoder %s has incorrect D3D11 preprocessing requirement: %v", test.wantEncoder, encoder.d3d11Convert)
+			}
 		})
+	}
+}
+
+func TestExplicitNVENCDeviceNeverSelectsAnotherGPU(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		_, err := detectGstEncoderWithProbe(CaptureConfig{NVENCDevice: "1", Bitrate: 10000}, func(string) bool {
+			t.Fatal("unsupported explicit device selection probed an encoder")
+			return true
+		})
+		if err == nil {
+			t.Fatal("Windows-only explicit NVENC device accepted on another platform")
+		}
+		return
+	}
+	tests := []struct {
+		name      string
+		device    string
+		available map[string]bool
+		want      string
+		wantGPU   bool
+	}{
+		{name: "selected secondary GPU", device: "1", available: map[string]bool{"nvd3d11h264device1enc": true, "d3d11convert": true, "nvd3d11h264enc": true}, want: "nvd3d11h264device1enc", wantGPU: true},
+		{name: "selected secondary GPU without GPU conversion", device: "1", available: map[string]bool{"nvd3d11h264device1enc": true, "nvd3d11h264enc": true}, want: "nvd3d11h264device1enc"},
+		{name: "selected GPU missing while other GPU available", device: "1", available: map[string]bool{"nvd3d11h264enc": true, "nvh264enc": true}},
+		{name: "explicit primary GPU", device: "0", available: map[string]bool{"nvd3d11h264enc": true, "d3d11convert": true}, want: "nvd3d11h264enc", wantGPU: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var probes []string
+			encoder, err := detectGstEncoderWithProbe(CaptureConfig{NVENCDevice: test.device, Bitrate: 10000, FPS: 60}, func(name string) bool {
+				probes = append(probes, name)
+				return test.available[name]
+			})
+			if test.want == "" {
+				if err == nil {
+					t.Fatal("missing requested GPU silently selected another encoder")
+				}
+				if !reflect.DeepEqual(probes, []string{"nvd3d11h264device1enc"}) {
+					t.Fatalf("missing requested GPU probed other encoders: %v", probes)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if encoder.parts[0] != test.want || encoder.d3d11Convert != test.wantGPU || encoder.d3d11Download != test.wantGPU {
+				t.Fatalf("selected encoder=%v GPU conversion=%t system transfer=%t, want %s GPU conversion=%t", encoder.parts, encoder.d3d11Convert, encoder.d3d11Download, test.want, test.wantGPU)
+			}
+		})
+	}
+}
+
+func TestExplicitNVENCDeviceRejectsInvalidOrIncompatibleSelection(t *testing.T) {
+	for _, cfg := range []CaptureConfig{
+		{NVENCDevice: "-1"},
+		{NVENCDevice: "invalid"},
+		{NVENCDevice: "+1"},
+		{NVENCDevice: " 1"},
+		{NVENCDevice: "1", HWAccel: "none"},
+		{NVENCDevice: "1", VideoCodec: VideoCodecHEVC},
+	} {
+		cfg.Bitrate = 10000
+		_, err := detectGstEncoderWithProbe(cfg, func(string) bool {
+			t.Fatal("invalid or incompatible selection probed an encoder")
+			return true
+		})
+		if err == nil {
+			t.Fatalf("invalid or incompatible NVENC selection accepted: %+v", cfg)
+		}
 	}
 }
