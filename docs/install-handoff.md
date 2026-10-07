@@ -101,4 +101,4 @@ Start from this repository on `main`; read this handoff, [CHANGELOG.md](../CHANG
 
 ## Publication checkpoint
 
-As of 2026-10-07, changes are committed locally, but the push was rejected because the active GitHub account lacks repository write access. No saved credential was available for the repository owner. Authenticate a write-authorized account, then run `git push origin main` from this checkout before expecting another device's clone to contain these changes. No credentials belong in this repository.
+On 2026-10-07, source and installation handoff commit `11f3f7a` was successfully pushed to `main` at <https://github.com/VelaguezSzpiech/doubletake-windows> after repository-owner authentication was restored. A fresh clone or `git pull --ff-only` now retrieves these changes. The locally built 1.0.1 installer is not a published GitHub binary release; the public v1.0.0 installer remains unchanged. No credentials belong in this repository.
