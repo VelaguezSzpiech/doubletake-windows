@@ -142,6 +142,17 @@ func runCLI() (resultErr error) {
 		credential = env
 	}
 
+	// Experiment overrides for the tray-launched app, whose command line is fixed.
+	// They apply only when set; the normal path is unchanged.
+	for name, target := range map[string]*int{"DOUBLETAKE_BITRATE_KBPS": bitrate, "DOUBLETAKE_FPS": fps} {
+		if env := os.Getenv(name); env != "" {
+			if v, err := strconv.Atoi(env); err == nil && v > 0 {
+				log.Printf("[EXPERIMENT] %s=%d overrides the command line", name, v)
+				*target = v
+			}
+		}
+	}
+
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
 	airplay.SetDebugMode(*debug)

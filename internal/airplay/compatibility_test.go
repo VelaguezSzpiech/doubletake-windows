@@ -259,3 +259,19 @@ func TestHybridAudioDescriptorLayouts(t *testing.T) {
 		t.Fatalf("plaintext streamConnections encryption flag = %#v, want false", rtp["streamConnectionKeyUseStreamEncryptionKey"])
 	}
 }
+
+func TestScreenAudioCodecEnvPrefersAACELDOnlyWhenAdvertised(t *testing.T) {
+	both := &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: FormatMask(screenAudioFormatALAC | screenAudioFormatAACELD44100Stereo)}}
+	alacOnly := &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: FormatMask(screenAudioFormatALAC)}}
+
+	if got, _ := screenAudioCodec(both); got != AudioCodecALAC {
+		t.Fatalf("default codec = %v, want ALAC", got)
+	}
+	t.Setenv("DOUBLETAKE_AUDIO_CODEC", "aac-eld")
+	if got, _ := screenAudioCodec(both); got != AudioCodecAACELD {
+		t.Fatalf("override codec = %v, want AAC-ELD", got)
+	}
+	if got, _ := screenAudioCodec(alacOnly); got != AudioCodecALAC {
+		t.Fatalf("override on ALAC-only receiver = %v, want ALAC", got)
+	}
+}

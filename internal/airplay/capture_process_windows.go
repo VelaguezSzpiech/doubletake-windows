@@ -21,7 +21,7 @@ func configureCaptureCommand(cmd *exec.Cmd) {
 // the Job Object before assignment. The non-inherited job handle is retained
 // until Wait completes; Windows closes it on parent death and kills every job
 // member. Failure to establish supervision is a startup error, not a fallback.
-func startGStreamerCommand(cmd *exec.Cmd) (<-chan error, error) {
+func startGStreamerCommandPlatform(cmd *exec.Cmd) (<-chan error, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create capture job: %w", err)

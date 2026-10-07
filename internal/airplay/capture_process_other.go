@@ -7,7 +7,7 @@ import (
 	"os/exec"
 )
 
-func startGStreamerCommand(cmd *exec.Cmd) (<-chan error, error) {
+func startGStreamerCommandPlatform(cmd *exec.Cmd) (<-chan error, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}

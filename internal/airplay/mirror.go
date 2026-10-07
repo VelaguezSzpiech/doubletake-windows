@@ -40,6 +40,40 @@ type mediaClock struct {
 	anchorLocal     time.Time
 	anchorTimestamp uint64
 	timelineID      uint64
+	fb              feedbackStats
+
+	// Diagnostics, cumulative for the clock's lifetime (guarded by mu).
+	diagAdvanceTotal                                          time.Duration
+	diagFeedbackTotal, diagClampedTotal, diagSlewLimitedTotal uint64
+}
+
+// mediaClockReanchor describes one receiver clock sample and what reanchor did
+// with it. It is diagnostic output only.
+type mediaClockReanchor struct {
+	receivedMillis, processingMillis uint64
+	sample, projected, applied       uint64 // receiver-timeline timestamps
+	hadAnchor                        bool
+	sinceAnchor                      time.Duration // local time since the previous anchor
+	phase                            time.Duration // sample minus projection
+	advance                          time.Duration // forward move applied to the clock
+	clamped, slewLimited             bool
+}
+
+type mediaClockSnapshot struct {
+	anchorLocal                                   time.Time
+	anchorTimestamp, timelineID                   uint64
+	advanceTotal                                  time.Duration
+	feedbackTotal, clampedTotal, slewLimitedTotal uint64
+}
+
+func (c *mediaClock) diagSnapshot() mediaClockSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return mediaClockSnapshot{
+		anchorLocal: c.anchorLocal, anchorTimestamp: c.anchorTimestamp, timelineID: c.timelineID,
+		advanceTotal: c.diagAdvanceTotal, feedbackTotal: c.diagFeedbackTotal,
+		clampedTotal: c.diagClampedTotal, slewLimitedTotal: c.diagSlewLimitedTotal,
+	}
 }
 
 func (c *mediaClock) configureFromSetup(response map[string]interface{}, headers map[string]string, receivedAt time.Time) error {
@@ -110,11 +144,28 @@ func receiverClockTimestamp(headers map[string]string) (timestamp, receivedMilli
 	return compactTimestamp(time.Duration(receivedMillis+processingMillis) * time.Millisecond), receivedMillis, processingMillis, nil
 }
 
+const (
+	// Forward receiver-clock corrections below the threshold move the shared
+	// media clock no faster than this fraction of elapsed time (100 ppm).
+	mediaClockMaxForwardSlew = 100e-6
+	mediaClockStepThreshold  = 5 * time.Millisecond
+)
+
 func (c *mediaClock) reanchor(headers map[string]string, receivedAt time.Time) error {
-	anchorTimestamp, _, _, err := receiverClockTimestamp(headers)
+	_, err := c.reanchorDetailed(headers, receivedAt)
+	return err
+}
+
+// reanchorDetailed is reanchor plus a description of the sample and the
+// applied correction for clock.feedback diagnostics.
+func (c *mediaClock) reanchorDetailed(headers map[string]string, receivedAt time.Time) (mediaClockReanchor, error) {
+	anchorTimestamp, receivedMillis, processingMillis, err := receiverClockTimestamp(headers)
 	if err != nil {
-		return err
+		return mediaClockReanchor{}, err
 	}
+	result := mediaClockReanchor{receivedMillis: receivedMillis, processingMillis: processingMillis, sample: anchorTimestamp}
+	var samplePhase, applied time.Duration
+	var clamped bool
 	c.mu.Lock()
 	// A feedback response carries the receiver's earlier request/processing
 	// timestamp but is observed only when the response reaches us. Network delay
@@ -122,15 +173,40 @@ func (c *mediaClock) reanchor(headers map[string]string, receivedAt time.Time) e
 	// use. Never move the shared clock backwards: audio and video must observe the
 	// same continuous timeline instead of relying on video-only packet clamping.
 	if !c.anchorLocal.IsZero() && !receivedAt.Before(c.anchorLocal) {
-		projected := c.anchorTimestamp + compactTimestamp(receivedAt.Sub(c.anchorLocal))
+		elapsed := receivedAt.Sub(c.anchorLocal)
+		projected := c.anchorTimestamp + compactTimestamp(elapsed)
+		samplePhase = timeFromNTP(anchorTimestamp).Sub(timeFromNTP(projected))
 		if anchorTimestamp < projected {
 			anchorTimestamp = projected
+			clamped = true
+		} else if samplePhase < mediaClockStepThreshold {
+			// Feedback timestamps are whole milliseconds, so a small forward phase
+			// is mostly quantization. Following it exactly makes the announced
+			// RTP-to-time mapping jump by up to ~2 ms; slew toward it instead and
+			// let later samples keep pulling. A real offset (above the threshold)
+			// is still applied at once.
+			if limit := compactTimestamp(time.Duration(float64(elapsed) * mediaClockMaxForwardSlew)); anchorTimestamp-projected > limit {
+				anchorTimestamp = projected + limit
+				result.slewLimited = true
+			}
 		}
+		applied = timeFromNTP(anchorTimestamp).Sub(timeFromNTP(projected))
+		result.hadAnchor, result.sinceAnchor, result.projected = true, elapsed, projected
 	}
 	c.anchorTimestamp = anchorTimestamp
 	c.anchorLocal = receivedAt
+	c.diagFeedbackTotal++
+	c.diagAdvanceTotal += applied
+	if clamped {
+		c.diagClampedTotal++
+	}
+	if result.slewLimited {
+		c.diagSlewLimitedTotal++
+	}
 	c.mu.Unlock()
-	return nil
+	c.recordFeedback(samplePhase, applied, clamped)
+	result.applied, result.phase, result.advance, result.clamped = anchorTimestamp, samplePhase, applied, clamped
+	return result, nil
 }
 
 // updateTimingPeerInfo switches to a newly advertised PTP timeline without
@@ -152,6 +228,10 @@ func (c *mediaClock) updateTimingPeerInfo(peer map[string]interface{}, receivedA
 	c.timelineID = timelineID
 	c.mu.Unlock()
 
+	diagEmit("clock.timeline_update", map[string]any{
+		"from": fmt.Sprintf("0x%016x", previousTimeline), "to": fmt.Sprintf("0x%016x", timelineID),
+		"changed": previousTimeline != timelineID, "peer_info": diagSanitize(peer),
+	})
 	dbg("[PTP] event timing peer update: timeline=0x%016x (was 0x%016x)", timelineID, previousTimeline)
 	return nil
 }
@@ -227,6 +307,7 @@ type MirrorSession struct {
 	frameClockNow      func() time.Time
 	timingProtocol     string
 	mediaClock         *mediaClock
+	vdiag              *videoDiag // nil-safe; nil for sessions not built by setupMirrorSession
 
 	// Audio
 	audioStream    *AudioStream
@@ -354,15 +435,27 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 	if err != nil {
 		return nil, nil, time.Time{}, fmt.Errorf("marshal %s SETUP: %w", phase, err)
 	}
+	requestedAt := time.Now()
 	responseBody, headers, err := c.rtspRequest("SETUP", uri, "application/x-apple-binary-plist", body, nil)
 	receivedAt := time.Now()
+	rec := map[string]any{
+		"step": "setup", "phase": phase, "uri": uri, "rtt_us": micros(receivedAt.Sub(requestedAt)),
+		"request": diagSanitize(request),
+	}
 	if err != nil {
+		rec["error"] = err.Error()
+		diagEmit("session.negotiated", rec)
 		return nil, nil, receivedAt, fmt.Errorf("%s SETUP: %w", phase, err)
 	}
 	var response map[string]interface{}
 	if _, err := plist.Unmarshal(responseBody, &response); err != nil {
+		rec["error"] = "unmarshal response: " + err.Error()
+		diagEmit("session.negotiated", rec)
 		return nil, nil, receivedAt, fmt.Errorf("unmarshal %s SETUP response: %w", phase, err)
 	}
+	rec["response"] = diagSanitizeResponse(response)
+	rec["response_headers"] = diagSafeHeaders(headers)
+	diagEmit("session.negotiated", rec)
 	dbg("[SETUP] %s response: %d bytes, %d fields", phase, len(responseBody), len(response))
 	return response, headers, receivedAt, nil
 }
@@ -557,10 +650,16 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			"Range":    "npt=0-",
 			"RTP-Info": "seq=0;rtptime=0",
 		}
+		requestedAt := time.Now()
 		_, responseHeaders, err := c.rtspRequest("RECORD", audioURI, "", nil, recordHeaders)
+		recordRec := map[string]any{"step": "record", "uri": audioURI, "rtt_us": micros(time.Since(requestedAt)), "request_headers": recordHeaders}
 		if err != nil {
+			recordRec["error"] = err.Error()
+			diagEmit("session.negotiated", recordRec)
 			return fmt.Errorf("RECORD: %w", err)
 		}
+		recordRec["response_headers"] = diagSafeHeaders(responseHeaders)
+		diagEmit("session.negotiated", recordRec)
 		if value, ok := responseHeaders["audio-latency"]; ok {
 			parsed, parseErr := strconv.ParseUint(value, 10, 32)
 			if parseErr != nil {
@@ -850,6 +949,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 
 	// Extract audio ports
+	receiverArrivalToRenderMs := 0
 	if streams, ok := audioResp["streams"].([]interface{}); ok {
 		for _, s := range streams {
 			stream, ok := s.(map[string]interface{})
@@ -860,6 +960,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			if streamType == 96 {
 				audioDataPort, audioControlPort = plistStreamPorts(stream)
 				if latency := plistInt(stream["arrivalToRenderLatencyMs"]); latency > 0 {
+					receiverArrivalToRenderMs = latency
 					// This is the receiver's platform/I/O delay, not the RTP
 					// playout lead negotiated in latencyMax and TimeAnnounce.
 					dbg("[SETUP] receiver arrival-to-render latency: %dms", latency)
@@ -967,14 +1068,18 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// Set volume to 0 dB (full scale). Positive dB values are invalid here and
 	// current receivers may interpret them as zero gain.
 	volumeBody := audioVolumeBody(false)
+	volumeStarted := time.Now()
 	_, _, err = c.rtspRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil)
+	emitSetParameterDiag(audioURI, volumeBody, time.Since(volumeStarted), err)
 	if err != nil {
 		dbg("[SETUP] SET_PARAMETER volume failed (non-fatal): %v", err)
 	} else {
 		dbg("[SETUP] SET_PARAMETER volume=0 sent")
 	}
 	// Send volume twice (pcap shows real senders do this)
-	_, _, _ = c.rtspRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil)
+	volumeStarted = time.Now()
+	_, _, repeatVolumeErr := c.rtspRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil)
+	emitSetParameterDiag(audioURI, volumeBody, time.Since(volumeStarted), repeatVolumeErr)
 
 	if timingProtocol == timingProtocolPTP {
 		// PTP uses the receiver's fixed 319/320 ports. The first socket was only
@@ -998,6 +1103,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		timestampBias:  latencies.video,
 		timingProtocol: timingProtocol,
 		mediaClock:     clock,
+		vdiag:          newVideoDiag(time.Now()),
 	}
 
 	// Set up the video cipher. Encrypted pair-verify uses ChaCha20-Poly1305 with
@@ -1086,8 +1192,63 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// leave it unanswered, and every control request is serialized on the same
 	// connection. A stuck GET_PARAMETER would therefore block /feedback long
 	// enough for the receiver to stop rendering video while audio continues.
+	latencySource := "connection_hint_normal_default"
+	if targetLatencyIsExplicit() {
+		latencySource = "explicit_target_latency"
+	}
+	audioSecurity := "legacy-aes"
+	if audioMode == audioSecurityChaCha {
+		audioSecurity = "chacha20-poly1305"
+	} else if audioKey == nil {
+		audioSecurity = "none"
+	}
+	videoCipher := "none"
+	if session.chachaCipher != nil {
+		videoCipher = "chacha20-poly1305"
+	} else if session.streamCipher != nil {
+		videoCipher = "aes-ctr"
+	}
+	summary := map[string]any{
+		"step":                           "summary",
+		"source_version":                 sourceVersion,
+		"timing_protocol":                timingProtocol,
+		"session_first_setup":            sessionFirstSetup,
+		"skip_record":                    skipRecord,
+		"latency_policy_source":          latencySource,
+		"latency_measured_capture_raise": measuredLatencyApplied,
+		"measured_video_latency_us":      micros(cfg.MeasuredVideoLatency),
+		"video_latency_us":               micros(latencies.video),
+		"audio_latency_us":               micros(latencies.audio),
+		"audio_latency_samples":          audioLatencySamples,
+		"video_codec":                    string(videoCodec),
+		"video_codec_requested":          string(normalizeVideoCodec(cfg.VideoCodec)),
+		"video_cipher":                   videoCipher,
+		"audio_codec_ct":                 audioCT,
+		"audio_spf":                      audioSPF,
+		"audio_format":                   fmt.Sprintf("0x%x", audioFmt),
+		"audio_sample_rate":              44100,
+		"audio_latency_min":              latMin,
+		"audio_latency_max":              latMax,
+		"audio_layout":                   audioLayoutName(audioLayout),
+		"audio_security":                 audioSecurity,
+		"audio_fec":                      useAudioFEC(selectedAudioCodec, audioMode == audioSecurityChaCha),
+		"audio_enabled":                  session.audioStream != nil,
+		"receiver_arrival_to_render_ms":  receiverArrivalToRenderMs,
+		"ports": map[string]int{
+			"video_data": dataPort, "audio_data": audioDataPort, "audio_control": audioControlPort,
+			"local_audio_control": audioControlLPort, "local_timing": timingPort, "event": receiverEventPort,
+		},
+	}
+	if clock != nil {
+		summary["ptp_timeline_id"] = fmt.Sprintf("0x%016x", clock.identity())
+		summary["ptp_local_peer_id"] = setupRequest.timingPeerID
+		summary["ptp_local_peer_address"] = setupRequest.timingPeerAddress
+	}
+	diagEmit("session.negotiated", summary)
+
 	session.startWorker(func() { session.dataHeartbeatLoop(sessionCtx) })
 	session.startWorker(func() { session.feedbackLoop(sessionCtx) })
+	session.startWorker(func() { session.videoDiagLoop(sessionCtx.Done()) })
 
 	setupSucceeded = true
 	return session, nil
@@ -1150,6 +1311,7 @@ func addFairPlayRootFields(request map[string]interface{}, ekey, eiv []byte, inc
 //   - IDR VCL: sent encrypted, header[4]=0x00 header[5]=0x00, AVCC payload
 //   - non-IDR VCL: sent encrypted, header[4]=0x00 header[5]=0x00, AVCC payload
 func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture, startDelay time.Duration) error {
+	s.vdiag.setCapture(capture, s.videoCodec)
 	if normalizeVideoCodec(s.videoCodec) == VideoCodecHEVC {
 		return s.streamHEVCFrames(ctx, capture, startDelay)
 	}
@@ -1197,6 +1359,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		// undecodable non-IDR frames that may cause receivers to close the stream.
 		if !streamPrimed {
 			if !pendingKeyframe || latestSPS == nil || latestPPS == nil {
+				s.vdiag.onUnprimed()
 				resetVCL()
 				return nil
 			}
@@ -1227,6 +1390,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			if err := s.sendCodecFrame(avcC, packetTimestamp); err != nil {
 				return fmt.Errorf("send codec: %w", err)
 			}
+			s.vdiag.onCodecFrame(VideoCodecH264, s.videoWidth, s.videoHeight, len(avcC), time.Now())
 			codecSent = true
 			streamPrimed = true
 			sentSPS = append(sentSPS[:0], latestSPS...)
@@ -1352,8 +1516,10 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			default:
 			}
 
+			readStart := time.Now()
 			accessUnit, err := capture.ReadVideoAccessUnit()
 			if len(accessUnit.AnnexB) > 0 {
+				s.vdiag.onAccessUnit(readStart, time.Now(), accessUnit.PTS, len(accessUnit.AnnexB))
 				if frameCount == 0 {
 					dbg("[CAPTURE] read timestamped access unit: %d bytes pts=%v", len(accessUnit.AnnexB), accessUnit.PTS)
 				}
@@ -1899,6 +2065,7 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 		s.lastSlowWriteLog = writeEnded
 	}
 	s.dataMu.Unlock()
+	s.vdiag.onSend(len(header)+len(framePayload), isKeyframe, writeStarted, writeEnded, err)
 	if err != nil {
 		dbg("[SEND] write error on frame seq=%d: %v", s.frameSeq, err)
 	} else if reportSlowWrite {
@@ -2015,18 +2182,34 @@ func (s *MirrorSession) feedbackLoop(ctx context.Context) {
 	// Start immediately after SETUP. Wayland's permission UI can delay the first
 	// captured frame for several seconds, but the receiver's feedback timeout is
 	// already running by then.
+	var exchangeSeq, errStreak uint64
+	var prevRequestedAt time.Time
 	sendFeedback := func() {
+		requestedAt := time.Now()
 		body, headers, err := s.client.rtspRequest("POST", "/feedback", "", nil, nil)
 		receivedAt := time.Now()
+		exchangeSeq++
+		exchange := feedbackExchange{
+			seq: exchangeSeq, requestedAt: requestedAt, respondedAt: receivedAt, prevRequestedAt: prevRequestedAt,
+			headers: headers, body: body, err: err,
+		}
+		prevRequestedAt = requestedAt
 		if err != nil {
+			errStreak++
+			exchange.errStreak = errStreak
+			diagEmit("clock.feedback", diagFeedbackExchangeRecord(exchange))
 			dbg("[FEEDBACK] error: %v", err)
 			return
 		}
+		errStreak = 0
 		if s.mediaClock != nil {
-			if err := s.mediaClock.reanchor(headers, receivedAt); err != nil {
+			result, err := s.mediaClock.reanchorDetailed(headers, receivedAt)
+			exchange.reanchor, exchange.reanchorErr, exchange.reanchored = result, err, err == nil
+			if err != nil {
 				dbg("[PTP] feedback clock update ignored: %v", err)
 			}
 		}
+		diagEmit("clock.feedback", diagFeedbackExchangeRecord(exchange))
 		if len(body) == 0 {
 			return
 		}
@@ -2073,7 +2256,13 @@ func (s *MirrorSession) Close() error {
 
 		// Send TEARDOWN to cleanly end the RTSP session on the receiver.
 		if s.sessionURI != "" && s.client != nil {
+			teardownStarted := time.Now()
 			_, _, err := s.client.rtspRequest("TEARDOWN", s.sessionURI, "", nil, nil)
+			teardownRec := map[string]any{"step": "teardown", "uri": s.sessionURI, "rtt_us": micros(time.Since(teardownStarted))}
+			if err != nil {
+				teardownRec["error"] = err.Error()
+			}
+			diagEmit("session.negotiated", teardownRec)
 			if err != nil {
 				dbg("[TEARDOWN] error: %v", err)
 			} else {
@@ -2213,6 +2402,7 @@ func (s *MirrorSession) AudioStarted() <-chan struct{} {
 // ntpTimingResponder replies to NTP timing requests from the Apple TV.
 func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 	buf := make([]byte, 128)
+	timingDiag := newNTPTimingDiag()
 	for {
 		select {
 		case <-ctx.Done():
@@ -2222,12 +2412,16 @@ func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 		}
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		n, addr, err := conn.ReadFrom(buf)
+		receivedAt := time.Now()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
 			dbg("[NTP] read error: %v", err)
 			return
+		}
+		if err == nil {
+			timingDiag.onPacket(buf[:n], addr, receivedAt)
 		}
 		dbg("[NTP] received %d bytes from %s", n, addr)
 
@@ -2261,8 +2455,11 @@ func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 		// Bytes 24-31: Transmit timestamp = now (NTP format, BE)
 		binary.BigEndian.PutUint64(reply[24:32], now)
 
-		if _, err := conn.WriteTo(reply, addr); err != nil {
-			dbg("[NTP] write error: %v", err)
+		replyStarted := time.Now()
+		_, writeErr := conn.WriteTo(reply, addr)
+		timingDiag.onReply(addr, receivedAt, now, time.Since(replyStarted), writeErr)
+		if writeErr != nil {
+			dbg("[NTP] write error: %v", writeErr)
 		} else {
 			dbg("[NTP] sent timing reply to %s", addr)
 		}
@@ -2387,6 +2584,7 @@ func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, ti
 	if !capturedAt.IsZero() {
 		age := now.Sub(capturedAt)
 		if age >= -time.Second && age <= 30*time.Second {
+			s.vdiag.onPTSAge(age, bias)
 			// Leave a small delivery margin for diagnostics. A late encoded frame must
 			// still be sent at its original deadline so H.264 reference continuity is
 			// preserved; the receiver decides whether its presentation is too late.
@@ -2398,7 +2596,9 @@ func (s *MirrorSession) frameTimeAtNow(capturedAt, now time.Time) (timestamp, ti
 			}
 			if s.mediaClock != nil {
 				if timestamp, timelineID, ok := s.mediaClock.at(capturedAt, bias); ok {
-					return s.monotonicFrameTime(timestamp), timelineID, true
+					mapped := s.monotonicFrameTime(timestamp)
+					s.vdiag.onFrameMap(capturedAt, timestamp, mapped)
+					return mapped, timelineID, true
 				}
 			} else if presentation, ok := addDurationToBootTime(capturedAt.Sub(now) + bias); ok {
 				return s.monotonicFrameTime(compactTimestamp(presentation)), 0, true

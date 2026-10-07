@@ -6,6 +6,8 @@ Windows modifications are maintained in [VelaguezSzpiech/doubletake-windows](htt
 
 ## Install and connect
 
+For installing the current source on another PC, use the [installation handoff](docs/install-handoff.md). It distinguishes the older public installer from current-source builds and includes device support, transfer, pairing and acceptance checks.
+
 1. Download `DoubleTake-Windows-1.0.0-Setup.exe` from the [latest release](https://github.com/VelaguezSzpiech/doubletake-windows/releases/latest). Releases also provide `SHA256SUMS.txt` for checking the downloaded installer.
 2. Run the installer. It installs for your current Windows user, normally under `%LOCALAPPDATA%\Programs\DoubleTake`, with a Start menu shortcut and an optional Desktop shortcut. It does **not** enable login autostart.
 3. Setup is **network-assisted**: it requires internet access only if a complete compatible GStreamer runtime is missing. In that case it downloads the official 64-bit MSVC GStreamer 1.28.6 installer, checks its pinned SHA-256 before running it, and checks the installed runtime. A download, hash or runtime failure stops setup visibly. **.NET is bundled self-contained**; end users do not need Go, a .NET SDK or a separate .NET runtime.
@@ -39,6 +41,7 @@ The public Windows v1.0.0 installer is unchanged and does not include these curr
 ## Documentation
 
 - [Building Windows, testing, and upstream Linux reference](docs/building.md)
+- [Installation handoff for another device](docs/install-handoff.md)
 - [Architecture, data flow, privacy and security](docs/architecture.md)
 - [Logs and troubleshooting: installation, VPN, pairing, audio and capture](docs/troubleshooting.md)
 - [Unreleased changes](CHANGELOG.md)

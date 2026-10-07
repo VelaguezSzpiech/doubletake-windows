@@ -1,7 +1,6 @@
 package airplay
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -900,6 +899,7 @@ func startPreparedWaylandCapture(ctx context.Context, cfg CaptureConfig, encoder
 	pwFd.Close() // child inherited it
 
 	go logStderr("GST", stderr)
+	stdout = gstCountStdout(cmd, stdout)
 
 	capture := &ScreenCapture{
 		cmd:      cmd,
@@ -980,6 +980,7 @@ func startPreparedX11Capture(ctx context.Context, cfg CaptureConfig, encoder enc
 	}
 
 	go logStderr("GST", stderr)
+	stdout = gstCountStdout(cmd, stdout)
 
 	capture := &ScreenCapture{
 		cmd:    cmd,
@@ -1448,6 +1449,7 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
 	}
 
 	go logStderr("GST", stderr)
+	stdout = gstCountStdout(cmd, stdout)
 
 	capture := &ScreenCapture{
 		cmd:    cmd,
@@ -1464,21 +1466,6 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
 	}()
 
 	return capture, nil
-}
-
-func logStderr(prefix string, r io.Reader) {
-	if r == nil {
-		return
-	}
-	scanner := bufio.NewScanner(r)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-	for scanner.Scan() {
-		dbg("[%s] %s", prefix, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		dbg("[%s] stderr read error: %v", prefix, err)
-	}
 }
 
 func captureBitrateKbps(cfg CaptureConfig) int {

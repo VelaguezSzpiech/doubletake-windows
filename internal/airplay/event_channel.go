@@ -71,10 +71,17 @@ func (c *AirPlayClient) connectEventChannel(ctx context.Context, port int, clock
 		return nil, nil
 	}
 	address := net.JoinHostPort(c.host, strconv.Itoa(port))
+	started := time.Now()
 	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
+	connectRec := map[string]any{"conn": "event", "remote": address, "connect_us": micros(time.Since(started)), "encrypted": c.encrypted}
 	if err != nil {
+		connectRec["error"] = err.Error()
+		connectRec["timeout"] = diagIsTimeout(err)
+		diagEmit("conn.connect", connectRec)
 		return nil, fmt.Errorf("dial event channel %s: %w", address, err)
 	}
+	connectRec["local"] = diagAddr(conn.LocalAddr())
+	diagEmit("conn.connect", connectRec)
 
 	var sharedSecret []byte
 	if c.PairKeys != nil {
@@ -176,6 +183,7 @@ type eventRequest struct {
 	contentType string
 	bodyLength  int
 	body        []byte
+	headers     map[string]string // all headers, lowercased names (diagnostics)
 }
 
 func readEventRequest(reader *bufio.Reader) (eventRequest, error) {
@@ -209,6 +217,10 @@ func readEventRequest(reader *bufio.Reader) (eventRequest, error) {
 		}
 		name = strings.ToLower(strings.TrimSpace(name))
 		value = strings.TrimSpace(value)
+		if request.headers == nil {
+			request.headers = map[string]string{}
+		}
+		request.headers[name] = value
 		switch name {
 		case "content-length":
 			contentLength, err = strconv.Atoi(value)
@@ -308,23 +320,55 @@ func serveEventChannel(ctx context.Context, channel *eventChannel, clock *mediaC
 	defer close(done)
 
 	reader := bufio.NewReaderSize(channel, 4096)
+	var received uint64
+	var lastReceived time.Time
 	for {
 		request, err := readEventRequest(reader)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+			clean := ctx.Err() != nil || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF)
+			diagEmit("event.closed", map[string]any{"error": err.Error(), "clean": clean, "timeout": diagIsTimeout(err), "rx_total": received})
+			if clean {
 				return nil
 			}
 			return err
 		}
 		receivedAt := time.Now()
+		received++
 
 		dbg("[EVENT] <- %s %s CSeq=%d body=%d", request.method, request.path, request.cseq, request.bodyLength)
-		if err := handleEventRequest(request, clock, receivedAt); err != nil {
-			dbg("[EVENT] command ignored: %v", err)
+		handleErr := handleEventRequest(request, clock, receivedAt)
+		if handleErr != nil {
+			dbg("[EVENT] command ignored: %v", handleErr)
+		}
+		rx := map[string]any{"method": request.method, "path": request.path, "cseq": request.cseq,
+			"headers": diagHeaders(request.headers), "body_bytes": request.bodyLength, "rx_total": received}
+		if !lastReceived.IsZero() {
+			rx["since_prev_ms"] = receivedAt.Sub(lastReceived).Milliseconds()
+		}
+		lastReceived = receivedAt
+		if body, truncated := diagDescribeBody(request.path, request.contentType, request.body); body != nil {
+			rx["body"] = body
+			if truncated {
+				rx["truncated"] = true
+			}
+		}
+		if handleErr != nil {
+			rx["handle_error"] = handleErr.Error()
 		}
 
 		response := fmt.Sprintf("RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n", request.cseq)
-		if _, err := channel.Write([]byte(response)); err != nil {
+		writeStarted := time.Now()
+		_, err = channel.Write([]byte(response))
+		// Records are emitted after the acknowledgement so logging never delays it.
+		diagEmit("event.rx", rx)
+		tx := map[string]any{"cseq": request.cseq, "status": 200, "bytes": len(response), "write_us": micros(time.Since(writeStarted)),
+			"response_delay_us": micros(time.Since(receivedAt))}
+		if err != nil {
+			tx["error"] = err.Error()
+			tx["timeout"] = diagIsTimeout(err)
+		}
+		diagEmit("event.tx", tx)
+		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}

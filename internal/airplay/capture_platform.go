@@ -70,6 +70,7 @@ func startPreparedWindowsCapture(ctx context.Context, cfg CaptureConfig, encoder
 		return nil, fmt.Errorf("start Windows desktop capture: %w", err)
 	}
 	go logStderr("GST", stderr)
+	stdout = gstCountStdout(cmd, stdout)
 	capture := &ScreenCapture{
 		cmd: cmd, stdout: stdout, cancel: cancel, waitCh: make(chan struct{}),
 	}

@@ -52,6 +52,12 @@ type rtpVideoAccessUnitReader struct {
 	fragmentIndicator  byte
 	fragmentType       byte
 	hevcFragmentHeader [2]byte
+
+	// drift follows the slow divergence between the pipeline clock that stamps
+	// frames and the host clock. The ONVIF wall offset is fixed once, so without
+	// this the apparent frame age grows at the host clock slew rate (about 10 ppm,
+	// measured) and video eventually arrives later than its playout deadline.
+	drift audioClockDriftTracker
 }
 
 func newRTPVideoAccessUnitReader(reader io.Reader, codecs ...VideoCodec) videoAccessUnitReader {
@@ -121,7 +127,8 @@ func (r *rtpVideoAccessUnitReader) ReadVideoAccessUnit() (VideoAccessUnit, error
 		// its monotonic clock reading. Downstream clock conversion can therefore
 		// subtract encoder and pipe delay without becoming sensitive to later
 		// wall-clock adjustments.
-		pts := now.Add(wallPTS.Sub(now))
+		arrivalAge := now.Sub(wallPTS)
+		pts := now.Add(r.drift.observe(now, arrivalAge) - arrivalAge)
 		accessUnit := r.accessUnit
 		r.accessUnit = nil
 		r.haveAccessUnitTimestamp = false

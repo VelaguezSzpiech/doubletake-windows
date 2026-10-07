@@ -2,6 +2,7 @@ package airplay
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -93,6 +94,11 @@ func compatibilityForReceiver(info *ReceiverInfo, encrypted, audioEnabled bool) 
 func screenAudioCodec(info *ReceiverInfo) (AudioCodec, error) {
 	if info == nil || info.SupportedFormats.ScreenStream == 0 {
 		return AudioCodecALAC, nil
+	}
+	// DOUBLETAKE_AUDIO_CODEC=aac-eld: experiment to prefer AAC-ELD when the receiver
+	// advertises it (needs a build with -tags fdk_aac).
+	if os.Getenv("DOUBLETAKE_AUDIO_CODEC") == "aac-eld" && info.SupportsAudioFormat("screenStream", screenAudioFormatAACELD44100Stereo) {
+		return AudioCodecAACELD, nil
 	}
 	if info.SupportsAudioFormat("screenStream", screenAudioFormatALAC) {
 		return AudioCodecALAC, nil

@@ -311,6 +311,13 @@ type AirPlayClient struct {
 	// Most recent Digest challenge seen on this connection. Cached so later
 	// requests can authenticate up front instead of relying on a retry.
 	authChallenge *digestChallenge
+
+	// Diagnostics only (see audio_diag_wire.go). lastStatus is the status code
+	// of the most recently parsed response; diagLastURI tracks per-URI request
+	// cadence. Both are guarded by mu like the connection they describe.
+	lastStatus   int
+	diagLastURI  map[string]time.Time
+	connectCount atomic.Int64
 }
 
 func NewAirPlayClient(host string, port int) *AirPlayClient {
@@ -429,17 +436,32 @@ func withHeader(hdrs map[string]string, key, value string) map[string]string {
 func (c *AirPlayClient) Connect(ctx context.Context) error {
 	addr := net.JoinHostPort(c.host, fmt.Sprintf("%d", c.port))
 	d := net.Dialer{Timeout: 10 * time.Second}
+	started := time.Now()
 	conn, err := d.DialContext(ctx, "tcp", addr)
+	attempt := c.connectCount.Add(1)
+	rec := map[string]any{"conn": "control", "remote": addr, "connect_us": micros(time.Since(started)),
+		"attempt": attempt, "reconnect": attempt > 1}
 	if err != nil {
+		rec["error"] = err.Error()
+		rec["timeout"] = diagIsTimeout(err)
+		diagEmit("conn.connect", rec)
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
+	rec["local"] = conn.LocalAddr().String()
+	diagEmit("conn.connect", rec)
 	c.conn = conn
 	return nil
 }
 
 func (c *AirPlayClient) Close() error {
 	if c.conn != nil {
-		return c.conn.Close()
+		err := c.conn.Close()
+		rec := map[string]any{"conn": "control", "remote": diagAddr(c.conn.RemoteAddr()), "local": diagAddr(c.conn.LocalAddr())}
+		if err != nil {
+			rec["error"] = err.Error()
+		}
+		diagEmit("conn.close", rec)
+		return err
 	}
 	return nil
 }
@@ -788,6 +810,7 @@ func (c *AirPlayClient) httpRequestOnce(method, path, contentType string, body [
 	buf.Write(body)
 
 	data := buf.Bytes()
+	ex := c.diagBeginExchange("http", method, path, contentType, body, data, seq)
 
 	dbg("[HTTP] -> %s %s (body=%d bytes, encrypted=%v, cseq=%d)", method, path, len(body), c.encrypted, seq)
 	if c.encrypted {
@@ -795,13 +818,48 @@ func (c *AirPlayClient) httpRequestOnce(method, path, contentType string, body [
 		data = c.encrypt(data)
 		dbg("[HTTP] encrypted %d plaintext -> %d ciphertext bytes", plainLen, len(data))
 	}
+	ex.wireBytes = len(data)
 
 	if _, err := c.conn.Write(data); err != nil {
-		return nil, nil, fmt.Errorf("write request: %w", err)
+		err = fmt.Errorf("write request: %w", err)
+		c.diagFinishExchange(ex, nil, nil, err)
+		return nil, nil, err
 	}
+	ex.wrote = time.Now()
 	dbg("[HTTP] wrote %d bytes to socket, waiting for response...", len(data))
 
-	return c.readHTTPResponseWithTimeout(timeout)
+	respBody, respHeaders, err := c.readHTTPResponseWithTimeout(timeout)
+	c.diagFinishExchange(ex, respBody, respHeaders, err)
+	return respBody, respHeaders, err
+}
+
+// diagBeginExchange starts an rtsp.exchange record for a serialized plaintext
+// request. Must be called with c.mu held.
+func (c *AirPlayClient) diagBeginExchange(proto, method, uri, contentType string, body, request []byte, seq int64) *controlExchangeDiag {
+	c.lastStatus = 0
+	now := time.Now()
+	ex := &controlExchangeDiag{proto: proto, method: method, uri: uri, cseq: uint64(seq), encrypted: c.encrypted,
+		request: request, reqBody: body, reqType: contentType, started: now}
+	key := method + " " + uri
+	if c.diagLastURI == nil {
+		c.diagLastURI = map[string]time.Time{}
+	}
+	if prev, ok := c.diagLastURI[key]; ok {
+		ex.sincePrevURI = now.Sub(prev)
+	}
+	c.diagLastURI[key] = now
+	return ex
+}
+
+// diagFinishExchange completes and emits the record. Must be called with c.mu held.
+func (c *AirPlayClient) diagFinishExchange(ex *controlExchangeDiag, respBody []byte, respHeaders map[string]string, err error) {
+	ex.respBody, ex.respHeaders, ex.err, ex.status = respBody, respHeaders, err, c.lastStatus
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		ex.status = statusErr.StatusCode
+		ex.respBody = statusErr.Body
+	}
+	ex.emit()
 }
 
 // rawRequest sends a bare RTSP/1.0 request without X-Apple-Session-ID or HAP
@@ -829,12 +887,18 @@ func (c *AirPlayClient) rawRequest(method, path, contentType string, body []byte
 
 	data := buf.Bytes()
 	dbg("[RAW] -> %s %s (body=%d bytes, cseq=%d)", method, path, len(body), seq)
+	ex := c.diagBeginExchange("raw", method, path, contentType, body, data, seq)
+	ex.encrypted, ex.wireBytes = false, len(data)
 
 	if _, err := c.conn.Write(data); err != nil {
-		return nil, fmt.Errorf("write request: %w", err)
+		err = fmt.Errorf("write request: %w", err)
+		c.diagFinishExchange(ex, nil, nil, err)
+		return nil, err
 	}
+	ex.wrote = time.Now()
 
-	resp, _, err := c.readHTTPResponse()
+	resp, respHeaders, err := c.readHTTPResponse()
+	c.diagFinishExchange(ex, resp, respHeaders, err)
 	if err != nil {
 		return nil, err
 	}
@@ -883,19 +947,25 @@ func (c *AirPlayClient) rtspRequestOnce(method, uri, contentType string, body []
 	buf.Write(body)
 
 	data := buf.Bytes()
+	ex := c.diagBeginExchange("rtsp", method, uri, contentType, body, data, seq)
 	dbg("[RTSP] -> %s %s (body=%d bytes, encrypted=%v, cseq=%d)", method, uri, len(body), c.encrypted, seq)
 	if c.encrypted {
 		plainLen := len(data)
 		data = c.encrypt(data)
 		dbg("[RTSP] encrypted %d plaintext -> %d ciphertext bytes", plainLen, len(data))
 	}
+	ex.wireBytes = len(data)
 
 	if _, err := c.conn.Write(data); err != nil {
-		return nil, nil, fmt.Errorf("write request: %w", err)
+		err = fmt.Errorf("write request: %w", err)
+		c.diagFinishExchange(ex, nil, nil, err)
+		return nil, nil, err
 	}
+	ex.wrote = time.Now()
 	dbg("[RTSP] wrote %d bytes to socket, waiting for response...", len(data))
 
 	respBody, respHeaders, err := c.readHTTPResponse()
+	c.diagFinishExchange(ex, respBody, respHeaders, err)
 	if err != nil {
 		// Return the headers even on failure: a 401 carries its
 		// WWW-Authenticate challenge there, and dropping them makes an
@@ -947,6 +1017,7 @@ func (c *AirPlayClient) readPlaintextHTTPResponse() ([]byte, map[string]string, 
 
 	header := headerBuf.String()
 	statusCode, contentLength, headers := parseHTTPHeader(header)
+	c.lastStatus = statusCode
 	dbg("[READ] status=%d content-length=%d", statusCode, contentLength)
 	if err := validateContentLength(contentLength); err != nil {
 		return nil, headers, err
@@ -1014,6 +1085,7 @@ func (c *AirPlayClient) readEncryptedHTTPResponse() ([]byte, map[string]string, 
 	remaining := decrypted[headerEnd+4:]
 
 	statusCode, contentLength, headers := parseHTTPHeader(header)
+	c.lastStatus = statusCode
 	dbg("[ENC-READ] status=%d content-length=%d remaining=%d", statusCode, contentLength, len(remaining))
 	if err := validateContentLength(contentLength); err != nil {
 		return nil, headers, err

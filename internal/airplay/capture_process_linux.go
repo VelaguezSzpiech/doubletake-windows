@@ -9,7 +9,7 @@ import (
 
 // Linux delivers Pdeathsig when the creating OS thread exits, not strictly
 // when the whole process exits. Keep that thread locked until Wait completes.
-func startGStreamerCommand(cmd *exec.Cmd) (<-chan error, error) {
+func startGStreamerCommandPlatform(cmd *exec.Cmd) (<-chan error, error) {
 	started := make(chan error, 1)
 	waitResult := make(chan error, 1)
 	go func() {

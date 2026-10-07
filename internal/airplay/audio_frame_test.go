@@ -1,6 +1,7 @@
 package airplay
 
 import (
+	"math"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -165,8 +166,8 @@ func TestRTPL16PCMFrameReaderDropsPartialFrameAtDiscontinuity(t *testing.T) {
 	if !pts.Equal(wantPTS) {
 		t.Fatalf("PTS after discontinuity = %v, want %v", pts, wantPTS)
 	}
-	if reader.discontinuities != 1 {
-		t.Fatalf("discontinuities = %d, want 1", reader.discontinuities)
+	if reader.discontinuities.Load() != 1 {
+		t.Fatalf("discontinuities = %d, want 1", reader.discontinuities.Load())
 	}
 }
 
@@ -378,4 +379,152 @@ func testNTPFromTime(value time.Time) uint64 {
 	seconds := uint64(value.Unix() + secondsFrom1900To1970)
 	fraction := (uint64(value.Nanosecond()) << 32) / uint64(time.Second)
 	return seconds<<32 | fraction
+}
+
+// driftingArrival returns the wall time at which packet i is delivered when the
+// source PTS runs behind the host clock by driftPPM and delivery adds jitter.
+func driftingArrival(base time.Time, i int, packetDuration time.Duration, driftPPM float64, jitter time.Duration) time.Time {
+	media := time.Duration(i) * packetDuration
+	return base.Add(10*time.Millisecond + media + time.Duration(float64(media)*driftPPM/1e6) + jitter)
+}
+
+func TestAudioClockDriftTrackerKeepsSourceAgeBoundedUnderDeviceClockDrift(t *testing.T) {
+	base := time.Unix(1787358000, 0)
+	const packetDuration = 8 * time.Millisecond
+	for _, driftPPM := range []float64{64, -64, 150, -150} {
+		var tracker audioClockDriftTracker
+		var worst time.Duration
+		for i := 0; i < 60*60*125; i++ { // one hour of 8ms packets
+			// Deterministic 0-6ms scheduling jitter, always non-negative.
+			jitter := time.Duration((i*7919)%6000) * time.Microsecond
+			now := driftingArrival(base, i, packetDuration, driftPPM, jitter)
+			pts := base.Add(time.Duration(i) * packetDuration)
+			correction := tracker.observe(now, now.Sub(pts))
+			if age := now.Sub(pts.Add(correction)); i > 120*125 && age > worst {
+				worst = age
+			}
+		}
+		// Uncorrected, +64ppm alone reaches ~230ms in an hour and crosses the 80ms
+		// stale threshold after ~21 minutes. Corrected age must stay near the
+		// 10ms delivery floor plus jitter.
+		// Allow the drift accumulated before the first fit exists (30 s, <=4.5ms at
+		// 150ppm); it is never recovered but does not grow.
+		if worst > 10*time.Millisecond+6*time.Millisecond+3*time.Millisecond+5*time.Millisecond {
+			t.Fatalf("drift %+.0fppm: worst corrected source age = %v, want it bounded near the delivery floor", driftPPM, worst)
+		}
+	}
+}
+
+func TestAudioClockDriftTrackerDoesNotAbsorbSuddenBacklog(t *testing.T) {
+	base := time.Unix(1787359000, 0)
+	var tracker audioClockDriftTracker
+	const packetDuration = 8 * time.Millisecond
+	i := 0
+	for ; i < 30*125; i++ {
+		now := base.Add(10*time.Millisecond + time.Duration(i)*packetDuration)
+		tracker.observe(now, 10*time.Millisecond)
+	}
+	// A real 60ms backlog appears instantly. It must age frames toward staleness,
+	// not be treated as slow clock drift.
+	var correction time.Duration
+	for end := i + 125; i < end; i++ {
+		now := base.Add(70*time.Millisecond + time.Duration(i)*packetDuration)
+		correction = tracker.observe(now, 70*time.Millisecond)
+	}
+	if correction > time.Millisecond {
+		t.Fatalf("correction one second after a 60ms step = %v, want at most the %.0fppm slew", correction, audioDriftMaxSlew*1e6)
+	}
+}
+
+func TestRTPL16PCMFrameReaderFollowsSourceClockDrift(t *testing.T) {
+	base := time.Unix(1787360000, 0).UTC()
+	const (
+		samplesPerPacket = 352
+		packets          = 3 * 60 * 125 // three minutes
+		driftPPM         = 150.0
+	)
+	packetDuration := audioSamplesDuration(samplesPerPacket)
+	payload, _ := testL16Samples(samplesPerPacket, 0x1000)
+	var stream bytes.Buffer
+	for i := 0; i < packets; i++ {
+		pts := base.Add(time.Duration(i) * packetDuration)
+		stream.Write(testFramedL16Packet(uint16(i), uint32(i*samplesPerPacket), pts, payload))
+	}
+	var arrivals int
+	reader := newRTPL16PCMFrameReaderWithNow(&stream, func() time.Time {
+		now := driftingArrival(base, arrivals, packetDuration, driftPPM, 0)
+		arrivals++
+		return now
+	})
+	pcm := make([]byte, samplesPerPacket*audioBytesPerSampleFrame)
+	var last audioPCMFramePosition
+	var lastNow time.Time
+	for i := 0; i < packets-2; i++ {
+		var err error
+		if last, err = reader.ReadPCMFramePosition(pcm); err != nil {
+			t.Fatal(err)
+		}
+		lastNow = driftingArrival(base, arrivals-1, packetDuration, driftPPM, 0)
+	}
+	if age := lastNow.Sub(last.PTS); age > 15*time.Millisecond {
+		t.Fatalf("source age after 3 minutes at %.0fppm drift = %v (correction %v), want it held near the 10ms start", driftPPM, age, last.ClockCorrection)
+	}
+	if last.ClockCorrection < 20*time.Millisecond {
+		t.Fatalf("clock correction = %v, want it to follow ~27ms of accumulated drift", last.ClockCorrection)
+	}
+	if !last.HasSourceRTP || last.SourceRTP != uint32((packets-3)*samplesPerPacket) {
+		t.Fatalf("drift correction disturbed sample positions: %#v", last)
+	}
+}
+
+// The receiver slews its playback clock to follow TimeAnnounce. The correction
+// must therefore be a smooth ramp: its one-second rate may not leave the real
+// drift by more than a crystal-scale margin, even under scheduling jitter.
+func TestAudioClockDriftTrackerCorrectionRateIsSmooth(t *testing.T) {
+	base := time.Unix(1787361000, 0)
+	const packetDuration = 8 * time.Millisecond
+	const driftPPM = 50.0
+	var tracker audioClockDriftTracker
+	var windowStart time.Duration
+	var worstDeviation float64
+	for i := 0; i < 30*60*125; i++ {
+		// Mixed jitter: usually small, occasionally a scheduler stall.
+		jitter := time.Duration((i*7919)%6000) * time.Microsecond
+		if i%3001 == 0 {
+			jitter += 50 * time.Millisecond
+		}
+		now := driftingArrival(base, i, packetDuration, driftPPM, jitter)
+		pts := base.Add(time.Duration(i) * packetDuration)
+		correction := tracker.observe(now, now.Sub(pts))
+		if i%125 == 0 && i > 0 {
+			if i > 6*60*125 { // after the fit has settled
+				if dev := math.Abs(float64(correction-windowStart)/float64(time.Second)*1e6 - driftPPM); dev > worstDeviation {
+					worstDeviation = dev
+				}
+			}
+			windowStart = correction
+		}
+	}
+	if worstDeviation > 30 {
+		t.Fatalf("correction rate strayed %.1f ppm from the true %.0f ppm drift in a one-second window", worstDeviation, driftPPM)
+	}
+}
+
+func TestRTPL16PCMFrameReaderPTSStaysOnMonotonicClock(t *testing.T) {
+	now := time.Now()
+	payload, _ := testL16Samples(352, 0x1000)
+	stream := testFramedL16Packet(1, 1000, now.Add(-10*time.Millisecond), payload)
+	reader := newRTPL16PCMFrameReaderWithNow(bytes.NewReader(stream), func() time.Time { return now })
+	position, err := reader.ReadPCMFramePosition(make([]byte, 352*audioBytesPerSampleFrame))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mediaClock anchors on monotonic readings. A PTS without one is subtracted on
+	// the wall clock, which steps whenever the host clock is disciplined.
+	if !strings.Contains(position.PTS.String(), "m=") {
+		t.Fatalf("source PTS %v has no monotonic reading", position.PTS)
+	}
+	if age := now.Sub(position.PTS); age < 9*time.Millisecond || age > 11*time.Millisecond {
+		t.Fatalf("source age = %v, want ~10ms", age)
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +33,130 @@ type audioPCMFramePosition struct {
 	PTS          time.Time
 	SourceRTP    uint32
 	HasSourceRTP bool
+	// ClockCorrection is the source-clock drift already folded into PTS. It is
+	// diagnostic only.
+	ClockCorrection time.Duration
+	// PCM describes the samples of this frame as handed to the encoder.
+	PCM audioPCMStats
+}
+
+const (
+	audioDriftBucket     = 5 * time.Second
+	audioDriftHistory    = 60 // buckets: a five-minute fit window
+	audioDriftMinBuckets = 6  // no correction until 30 s of history exists
+	// The receiver slews its playback clock to follow TimeAnnounce, so the
+	// correction must change smoothly: it follows a long linear fit, and its rate
+	// may never leave a crystal's plausible range. A faster apparent change is a
+	// real delay and must stay visible as staleness.
+	audioDriftMaxSlew  = 200e-6
+	audioDriftMaxSlope = 300e-6
+)
+
+// audioClockDriftTracker follows the slow divergence between the capture
+// device's sample clock (which the ONVIF timestamps are derived from, with a
+// wall-clock offset computed once at pipeline start) and the host wall clock.
+//
+// Without it, a device clock that runs slow relative to the host makes every
+// source PTS fall further behind wall time. TimeAnnounce then tells the receiver
+// that samples play earlier than they can possibly arrive: packets turn late,
+// the receiver glitches, and finally every frame is classed stale and dropped.
+//
+// The minimum arrival age (now - PTS) of each five-second bucket is the delivery
+// floor: scheduling jitter only adds to it, drift moves it. A least-squares line
+// through five minutes of those floors gives the drift as a smooth ramp. Tracking
+// the raw floor instead made the announced RTP/time mapping wobble by +-1 ms
+// (smoothness, not audibility, is what the tests check).
+type audioClockDriftTracker struct {
+	times      [audioDriftHistory]float64 // bucket start, seconds since origin
+	floors     [audioDriftHistory]float64 // bucket minimum age, microseconds
+	count      int
+	origin     time.Time
+	bucketAt   time.Time
+	bucketMin  time.Duration
+	haveBucket bool
+
+	haveFit    bool
+	fitA, fitB float64 // age_us = fitA + fitB*seconds
+	ref        float64 // fit value corresponding to zero correction, microseconds
+	haveRef    bool
+	correction time.Duration
+	updatedAt  time.Time
+}
+
+func (d *audioClockDriftTracker) closeBucket() {
+	if d.count == audioDriftHistory {
+		copy(d.times[:], d.times[1:])
+		copy(d.floors[:], d.floors[1:])
+		d.count--
+	}
+	d.times[d.count] = d.bucketAt.Sub(d.origin).Seconds()
+	d.floors[d.count] = float64(d.bucketMin.Microseconds())
+	d.count++
+	d.haveFit = false
+	if d.count < audioDriftMinBuckets {
+		return
+	}
+	var sx, sy, sxx, sxy float64
+	n := float64(d.count)
+	for i := 0; i < d.count; i++ {
+		sx += d.times[i]
+		sy += d.floors[i]
+		sxx += d.times[i] * d.times[i]
+		sxy += d.times[i] * d.floors[i]
+	}
+	denom := n*sxx - sx*sx
+	if denom <= 0 {
+		return
+	}
+	slope := (n*sxy - sx*sy) / denom // microseconds per second == ppm
+	if limit := audioDriftMaxSlope * 1e6; slope > limit {
+		slope = limit
+	} else if slope < -limit {
+		slope = -limit
+	}
+	// Re-center the line on the mean so clamping the slope keeps it on the data.
+	d.fitB = slope
+	d.fitA = sy/n - slope*sx/n
+	d.haveFit = true
+}
+
+// observe records one packet's arrival age and returns the drift correction to
+// add to its PTS.
+func (d *audioClockDriftTracker) observe(now time.Time, age time.Duration) time.Duration {
+	if !d.haveBucket || now.Sub(d.bucketAt) >= audioDriftBucket*audioDriftHistory {
+		// First packet, or history too old to describe the present. The
+		// correction carries over and the next fit is re-referenced to it.
+		d.count, d.haveFit, d.haveRef = 0, false, false
+		d.origin, d.bucketAt, d.bucketMin, d.haveBucket = now, now, age, true
+		d.updatedAt = now
+		return d.correction
+	}
+	if now.Sub(d.bucketAt) >= audioDriftBucket {
+		d.closeBucket()
+		d.bucketAt, d.bucketMin = now, age
+	} else if age < d.bucketMin {
+		d.bucketMin = age
+	}
+
+	dt := now.Sub(d.updatedAt)
+	d.updatedAt = now
+	if !d.haveFit || dt <= 0 {
+		return d.correction
+	}
+	at := d.fitA + d.fitB*now.Sub(d.origin).Seconds()
+	if !d.haveRef {
+		d.ref, d.haveRef = at-float64(d.correction.Microseconds()), true
+	}
+	target := time.Duration((at - d.ref) * float64(time.Microsecond))
+	maxStep := time.Duration(float64(dt) * audioDriftMaxSlew)
+	delta := target - d.correction
+	if delta > maxStep {
+		delta = maxStep
+	} else if delta < -maxStep {
+		delta = -maxStep
+	}
+	d.correction += delta
+	return d.correction
 }
 
 type audioPCMFramePositionReader interface {
@@ -55,7 +180,8 @@ type rtpL16PCMFrameReader struct {
 	sequence        uint16
 	ssrc            uint32
 
-	discontinuities uint64
+	drift           audioClockDriftTracker
+	discontinuities atomic.Uint64
 }
 
 func newRTPL16PCMFrameReader(reader io.Reader) audioPCMFrameReader {
@@ -98,7 +224,7 @@ func (r *rtpL16PCMFrameReader) ReadPCMFramePosition(dst []byte) (audioPCMFramePo
 	copy(dst, r.pcm[:len(dst)])
 	r.pcm = r.pcm[len(dst):]
 	r.consumedSamples += uint64(len(dst) / audioBytesPerSampleFrame)
-	return audioPCMFramePosition{PTS: pts, SourceRTP: sourceRTP, HasSourceRTP: true}, nil
+	return audioPCMFramePosition{PTS: pts, SourceRTP: sourceRTP, HasSourceRTP: true, ClockCorrection: r.drift.correction}, nil
 }
 
 func (r *rtpL16PCMFrameReader) readPacket() error {
@@ -120,7 +246,13 @@ func (r *rtpL16PCMFrameReader) readPacket() error {
 
 	wallPTS := timeFromNTP(header.onvifTimestamp)
 	now := r.now()
-	packetPTS := now.Add(wallPTS.Sub(now))
+	// The ONVIF wall offset was fixed at pipeline start; follow the device
+	// clock's drift against the host so PTS keeps meaning capture time.
+	// Express PTS on the monotonic clock (now carries a reading, wallPTS does not):
+	// mediaClock anchors on it, and mixing in wall-clock arithmetic made the
+	// announced mapping step whenever the host wall clock was being disciplined.
+	arrivalAge := now.Sub(wallPTS)
+	packetPTS := now.Add(r.drift.observe(now, arrivalAge) - arrivalAge)
 	discontinuous := !r.haveTimeline
 	if r.haveTimeline {
 		expectedRTP := r.timelineRTP + uint32(r.receivedSamples)
@@ -129,9 +261,13 @@ func (r *rtpL16PCMFrameReader) readPacket() error {
 		discontinuous = !r.havePacket || header.sequence != r.sequence+1 || header.ssrc != r.ssrc ||
 			header.timestamp != expectedRTP
 		if discontinuous {
-			r.discontinuities++
-			dbg("[AUDIO] capture discontinuity: seq=%d->%d rtp=%d->%d pts-delta=%d samples; dropping %d partial PCM bytes",
-				r.sequence, header.sequence, expectedRTP, header.timestamp, ptsDeltaSamples, len(r.pcm))
+			r.discontinuities.Add(1)
+			diagEmit("audio.capture_discontinuity", map[string]any{
+				"seq_from": r.sequence, "seq_to": header.sequence,
+				"rtp_expected": expectedRTP, "rtp_got": header.timestamp,
+				"pts_delta_samples": ptsDeltaSamples, "partial_pcm_bytes_dropped": len(r.pcm),
+				"ssrc_changed": header.ssrc != r.ssrc,
+			})
 		}
 	}
 	if !discontinuous {

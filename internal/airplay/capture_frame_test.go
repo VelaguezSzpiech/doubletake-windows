@@ -351,3 +351,34 @@ func ntpFromTime(value time.Time) uint64 {
 	fraction := (uint64(value.Nanosecond()) << 32) / uint64(time.Second)
 	return seconds<<32 | fraction
 }
+
+func TestRTPVideoAccessUnitReaderFollowsHostClockSlew(t *testing.T) {
+	base := time.Now()
+	const frame = time.Second / 60
+	const slewPPM = 10.0
+	var packets []testRTPPacket
+	var stamps []time.Time
+	for i := 0; i < 60*60*20; i++ { // 20 minutes of 60 fps access units
+		media := time.Duration(i) * frame
+		// The pipeline stamps frames with a clock that lags the host by slewPPM.
+		stamp := base.Add(media - time.Duration(float64(media)*slewPPM/1e6))
+		stamps = append(stamps, base.Add(media+10*time.Millisecond))
+		packets = append(packets, testRTPPacket{uint16(i), uint32(i) * 1500, ntpFromTime(stamp.Round(0)), true, []byte{0x41, 0x01}})
+	}
+	var current int
+	reader := newRTPVideoAccessUnitReaderWithNow(bytes.NewReader(joinTestRTPPackets(packets...)), func() time.Time { return stamps[current] })
+	var worst time.Duration
+	for current = range stamps {
+		unit, err := reader.ReadVideoAccessUnit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if age := stamps[current].Sub(unit.PTS); current > 120*60 && age > worst {
+			worst = age
+		}
+	}
+	// Uncorrected, 10 ppm over 20 minutes adds 12 ms of apparent age.
+	if worst > 14*time.Millisecond {
+		t.Fatalf("video frame age reached %v; the host clock slew was not followed", worst)
+	}
+}

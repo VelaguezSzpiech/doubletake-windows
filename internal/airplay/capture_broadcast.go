@@ -59,6 +59,8 @@ type BroadcastCapture struct {
 	drainTimeout time.Duration
 
 	sinks []*BroadcastSink
+
+	diagFramesRead uint64 // access units read from the encoder; guarded by mu
 }
 
 // BroadcastSink is a reader end of a BroadcastCapture. It satisfies the same
@@ -88,6 +90,10 @@ type BroadcastSink struct {
 	maxFrameQueueDuration time.Duration
 	backpressure          bool
 	blockedProducers      int // number waiting for queue handoff; guarded by mu
+	// Diagnostics only (guarded by mu): how often and how long the producer
+	// waited on a backpressured sink.
+	diagProducerWaits uint64
+	diagProducerWait  time.Duration
 
 	inputClosed   bool // the source ended; drain queue, then return EOF
 	closed        bool // explicitly removed; discard queue and return EOF
@@ -266,6 +272,7 @@ func (bc *BroadcastCapture) runFrames() error {
 		frame, readErr := bc.src.ReadVideoAccessUnit()
 		if len(frame.AnnexB) > 0 {
 			bc.mu.Lock()
+			bc.diagFramesRead++
 			sinks := make([]*BroadcastSink, 0, len(bc.sinks))
 			for _, sink := range bc.sinks {
 				if sink.startSequence <= sequence {
@@ -276,6 +283,7 @@ func (bc *BroadcastCapture) runFrames() error {
 
 			for _, sink := range sinks {
 				if err := sink.enqueueFrame(frame); err != nil {
+					diagEmit("video.sink_detached", map[string]any{"error": err.Error(), "frame_bytes": len(frame.AnnexB)})
 					bc.RemoveSink(sink)
 				}
 			}
@@ -405,7 +413,10 @@ func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 		}
 		if s.backpressure && len(s.frameQueue) > 0 {
 			s.blockedProducers++
+			waitStart := time.Now()
 			s.cond.Wait()
+			s.diagProducerWait += time.Since(waitStart)
+			s.diagProducerWaits++
 			s.blockedProducers--
 			continue
 		}
@@ -579,4 +590,28 @@ func (s *BroadcastSink) Close() {
 		return
 	}
 	s.abort()
+}
+
+// diagQueueStats samples this sink's queue for video.health. It takes the
+// sink and owner locks one after the other, never nested.
+func (s *BroadcastSink) diagQueueStats() map[string]any {
+	s.mu.Lock()
+	rec := map[string]any{
+		"frames":                 len(s.frameQueue),
+		"chunks":                 len(s.queue),
+		"kb":                     s.queuedBytes / 1024,
+		"queued_duration_ms":     s.queuedFrameDuration.Milliseconds(),
+		"backpressure":           s.backpressure,
+		"producers_blocked":      s.blockedProducers,
+		"producer_waits_total":   s.diagProducerWaits,
+		"producer_wait_ms_total": s.diagProducerWait.Milliseconds(),
+	}
+	s.mu.Unlock()
+	if s.owner != nil {
+		s.owner.mu.Lock()
+		rec["encoder_frames_total"] = s.owner.diagFramesRead
+		rec["sinks"] = len(s.owner.sinks)
+		s.owner.mu.Unlock()
+	}
+	return rec
 }

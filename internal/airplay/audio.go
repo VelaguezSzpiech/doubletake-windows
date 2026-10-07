@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	aeadchacha20poly1305 "github.com/aead/chacha20poly1305"
@@ -262,6 +263,7 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		return nil, fmt.Errorf("start audio capture pipeline: %w", err)
 	}
 	go logStderr("AUDIO-GST", gstStderr)
+	gstStdout = gstCountStdout(gstCmd, gstStdout)
 
 	ac.gstCmd = gstCmd
 	ac.pcmPipe = gstStdout
@@ -288,6 +290,13 @@ func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 func (ac *AudioCapture) ReadFrameAt(buf []byte) (int, time.Time, error) {
 	n, position, err := ac.readFramePosition(buf)
 	return n, position.PTS, err
+}
+
+func (ac *AudioCapture) captureDiscontinuities() uint64 {
+	if reader, ok := ac.pcmFrames.(*rtpL16PCMFrameReader); ok {
+		return reader.discontinuities.Load()
+	}
+	return 0
 }
 
 func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePosition, error) {
@@ -320,6 +329,7 @@ func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePositio
 	if err != nil {
 		return 0, audioPCMFramePosition{}, err
 	}
+	position.PCM = measurePCM(pcm, channels)
 	if ac.codec == AudioCodecAACELD {
 		ac.eldMu.Lock()
 		defer ac.eldMu.Unlock()
@@ -551,6 +561,64 @@ type AudioStream struct {
 	mu              sync.Mutex
 	historyMu       sync.RWMutex
 	packetHistory   [audioRetransmitHistoryPackets]audioPacketHistoryEntry
+
+	// Receiver loss reports, for diagnostics.
+	retransmitRequests, retransmitResent, retransmitExpired atomic.Uint64
+
+	// Previous TimeAnnounce, for audio.time_announce deltas. Never taken by
+	// the media send path.
+	annDiagMu   sync.Mutex
+	annDiagPrev audioAnnounceDiag
+}
+
+// audioAnnounceDiag describes one TimeAnnounce for audio.time_announce. It is
+// built while the caller may hold announceMu and emitted after release.
+type audioAnnounceDiag struct {
+	at                    time.Time
+	protocol              string
+	first                 bool
+	rtpNow, syncRTP       uint32
+	latencySamples        uint32
+	networkTime, timeline uint64
+	pts                   time.Time
+	bytes                 int
+	writeTook             time.Duration
+	err                   error
+
+	prevOK  bool
+	prevAt  time.Time
+	prevRTP uint32
+	prevNet uint64
+}
+
+func (a audioAnnounceDiag) emit() {
+	if a.at.IsZero() {
+		return
+	}
+	rec := map[string]any{
+		"protocol": a.protocol, "first": a.first, "rtp": a.rtpNow, "sync_rtp": a.syncRTP,
+		"latency_samples": a.latencySamples, "network_ts": fmt.Sprintf("0x%016x", a.networkTime),
+		"network_ns": ptpNanoseconds(a.networkTime), "timeline_id": fmt.Sprintf("0x%016x", a.timeline),
+		"bytes": a.bytes, "write_us": micros(a.writeTook),
+	}
+	if !a.pts.IsZero() {
+		rec["anchor_pts_age_us"] = micros(a.at.Sub(a.pts))
+	}
+	if a.prevOK {
+		dNet := time.Duration(float64(int64(a.networkTime-a.prevNet)) / (1 << 32) * float64(time.Second))
+		dRTP := int64(int32(a.rtpNow - a.prevRTP))
+		rec["d_rtp"] = dRTP
+		rec["d_network_us"] = micros(dNet)
+		rec["mapping_err_us"] = micros(dNet - time.Duration(float64(dRTP)/audioSampleRate*float64(time.Second)))
+		if dRTP < 0 {
+			rec["rtp_went_backwards"] = true
+		}
+		rec["since_prev_ms"] = a.at.Sub(a.prevAt).Milliseconds()
+	}
+	if a.err != nil {
+		rec["error"] = a.err.Error()
+	}
+	diagEmit("audio.time_announce", rec)
 }
 
 // AudioCodec returns the codec negotiated for this mirror session.
@@ -856,6 +924,8 @@ func (as *AudioStream) handleAudioControlPacket(packet []byte, addr net.Addr) (h
 	// At most one more lookup than the bounded history can succeed. This keeps a
 	// malformed count from amplifying traffic while still producing the official
 	// futile response at the first sequence we cannot serve.
+	as.retransmitRequests.Add(1)
+	defer func() { as.retransmitResent.Add(uint64(resent)) }()
 	requestCount := int(request.count)
 	if requestCount > len(as.packetHistory)+1 {
 		requestCount = len(as.packetHistory) + 1
@@ -864,6 +934,7 @@ func (as *AudioStream) handleAudioControlPacket(packet []byte, addr net.Addr) (h
 		seq := request.firstSeq + uint16(offset)
 		original := as.audioPacketForRetransmit(seq)
 		if original == nil {
+			as.retransmitExpired.Add(1)
 			response := make([]byte, 8)
 			response[0] = 0x80
 			response[1] = audioRetransmitResponsePayloadType
@@ -932,9 +1003,31 @@ func (as *AudioStream) sendSyncPacket(timingProtocol string, networkTime, timeli
 // sendSyncPacketAt publishes an RTP and network-time pair describing the same
 // source-clock instant. Official senders derive both values from one host tick.
 func (as *AudioStream) sendSyncPacketAt(timingProtocol string, networkTime, timelineID uint64, rtpNow uint32, isFirst bool) error {
+	record, err := as.sendSyncPacketDiag(timingProtocol, networkTime, timelineID, rtpNow, isFirst, time.Time{})
+	record.emit()
+	return err
+}
+
+// sendSyncPacketDiag sends a TimeAnnounce and returns its diagnostic record
+// for the caller to emit outside any lock shared with the media loop. pts is
+// the local source time the announce describes (zero when unknown).
+func (as *AudioStream) sendSyncPacketDiag(timingProtocol string, networkTime, timelineID uint64, rtpNow uint32, isFirst bool, pts time.Time) (record audioAnnounceDiag, err error) {
 	as.mu.Lock()
 	latencySamples := as.latencySamples
 	as.mu.Unlock()
+
+	record = audioAnnounceDiag{at: time.Now(), protocol: timingProtocol, first: isFirst, rtpNow: rtpNow,
+		syncRTP: rtpNow - latencySamples, latencySamples: latencySamples, networkTime: networkTime, timeline: timelineID, pts: pts}
+	defer func() {
+		record.err = err
+		as.annDiagMu.Lock()
+		prev := as.annDiagPrev
+		if err == nil {
+			as.annDiagPrev = audioAnnounceDiag{prevOK: true, prevAt: record.at, prevRTP: rtpNow, prevNet: networkTime}
+		}
+		as.annDiagMu.Unlock()
+		record.prevOK, record.prevAt, record.prevRTP, record.prevNet = prev.prevOK, prev.prevAt, prev.prevRTP, prev.prevNet
+	}()
 
 	packetSize := 0
 	switch timingProtocol {
@@ -942,12 +1035,13 @@ func (as *AudioStream) sendSyncPacketAt(timingProtocol string, networkTime, time
 		packetSize = 20
 	case timingProtocolPTP:
 		if timelineID == 0 {
-			return fmt.Errorf("PTP TimeAnnounce requires a receiver timeline ID")
+			return record, fmt.Errorf("PTP TimeAnnounce requires a receiver timeline ID")
 		}
 		packetSize = 28
 	default:
-		return fmt.Errorf("unsupported audio timing protocol %q", timingProtocol)
+		return record, fmt.Errorf("unsupported audio timing protocol %q", timingProtocol)
 	}
+	record.bytes = packetSize
 	packet := make([]byte, packetSize)
 	if isFirst {
 		packet[0] = 0x90 // V=2, X=1
@@ -979,8 +1073,10 @@ func (as *AudioStream) sendSyncPacketAt(timingProtocol string, networkTime, time
 
 	dbg("[AUDIO-SYNC] first=%t rtp=%d latency=%d network=0x%016x timeline=0x%016x",
 		isFirst, rtpNow, latencySamples, networkTime, timelineID)
-	_, err := writeAudioDatagram(as.ctrlConn, packet, as.ctrlAddr)
-	return err
+	writeStarted := time.Now()
+	_, err = writeAudioDatagram(as.ctrlConn, packet, as.ctrlAddr)
+	record.writeTook = time.Since(writeStarted)
+	return record, err
 }
 
 func ptpNanoseconds(timestamp uint64) uint64 {
@@ -1077,10 +1173,22 @@ func (as *AudioStream) Close() {
 
 // StreamAudio reads encoded frames from the capture pipeline and sends
 // RTP audio packets to the receiver. It also sends periodic sync packets.
-func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, audioStream *AudioStream) error {
+func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, audioStream *AudioStream) (retErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	var workers sync.WaitGroup
+	diag := newAudioDiag(time.Now())
+	sysDiagHost := ""
+	if s.client != nil {
+		sysDiagHost = s.client.host
+	}
+	stopSystemDiag := StartSystemDiag(ctx, sysDiagHost)
+	defer stopSystemDiag()
 	defer func() {
+		stop := map[string]any{"frames_sent_total": diag.framesSentTotal(), "clean": retErr == nil || ctx.Err() != nil}
+		if retErr != nil {
+			stop["error"] = retErr.Error()
+		}
+		diagEmit("audio.stop", stop)
 		// The periodic announce and RTCP reader are owned by this call. Closing the
 		// sockets unblocks ReadFrom; cancellation stops the ticker before returning.
 		cancel()
@@ -1178,11 +1286,20 @@ videoReady:
 	if timestampedAudio {
 		clockNow, timelineID = s.audioClockAt(firstFramePosition.PTS)
 	}
-	if err := audioStream.sendSyncPacketAt(s.timingProtocol, clockNow, timelineID, firstFrameRTP, true); err != nil {
+	initialPTS := time.Time{}
+	if timestampedAudio {
+		initialPTS = firstFramePosition.PTS
+	}
+	initialAnnounce, err := audioStream.sendSyncPacketDiag(s.timingProtocol, clockNow, timelineID, firstFrameRTP, true, initialPTS)
+	initialAnnounce.emit()
+	if err != nil {
 		return fmt.Errorf("audio initial clock mapping: %w", err)
 	}
 	dbg("[AUDIO] sent initial source clock mapping pts=%v sourceRTP=%d rtp=%d",
 		firstFramePosition.PTS, firstFramePosition.SourceRTP, firstFrameRTP)
+
+	// Per-packet wire statistics; the media loop only touches atomics.
+	wire := newAudioWireStats(spf, time.Now())
 
 	// Apple senders refresh TimeAnnounce once per second.
 	workers.Add(1)
@@ -1197,7 +1314,9 @@ videoReady:
 			case <-ticker.C:
 				if !timestampedAudio {
 					clockNow, timelineID := s.audioClockNow()
+					diag.announces.Add(1)
 					if err := audioStream.sendSyncPacket(s.timingProtocol, clockNow, timelineID, false); err != nil {
+						diag.announceErrors.Add(1)
 						dbg("[AUDIO] sync error: %v", err)
 					}
 					continue
@@ -1209,10 +1328,15 @@ videoReady:
 					continue
 				}
 				clockNow, timelineID := s.audioClockAt(announcedAt)
-				err := audioStream.sendSyncPacketAt(s.timingProtocol, clockNow, timelineID, rtpNow, false)
+				announce, err := audioStream.sendSyncPacketDiag(s.timingProtocol, clockNow, timelineID, rtpNow, false, announcedAt)
 				announceMu.Unlock()
+				announce.emit() // outside announceMu: the media loop takes it per frame
+				diag.announces.Add(1)
 				if err != nil {
+					diag.announceErrors.Add(1)
 					dbg("[AUDIO] sync error: %v", err)
+				} else {
+					diag.onAnnounce(rtpNow, clockNow)
 				}
 			}
 		}
@@ -1223,20 +1347,59 @@ videoReady:
 	go func() {
 		defer workers.Done()
 		buf := make([]byte, 1024)
+		ctrlLimiter := diagRateLimiter{limit: audioCtrlRxPerSec}
+		var ctrlRxTotal uint64
+		var lastCtrlRx time.Time
 		for {
 			n, addr, err := audioStream.ctrlConn.ReadFrom(buf)
 			if err != nil {
-				if ctx.Err() != nil {
+				clean := ctx.Err() != nil
+				diagEmit("audio.ctrl_closed", map[string]any{"error": err.Error(), "clean": clean, "timeout": diagIsTimeout(err),
+					"rx_total": ctrlRxTotal, "suppressed_n": ctrlLimiter.pending()})
+				if clean {
 					return
 				}
 				dbg("[AUDIO] control read error: %v", err)
 				return
 			}
-			if !audioStream.audioControlPacketFromReceiver(addr) {
+			receivedAt := time.Now()
+			ctrlRxTotal++
+			fromReceiver := audioStream.audioControlPacketFromReceiver(addr)
+			var handled bool
+			var resent int
+			var handleErr error
+			expiredBefore := audioStream.retransmitExpired.Load()
+			if fromReceiver {
+				handled, resent, handleErr = audioStream.handleAudioControlPacket(buf[:n], addr)
+			}
+			// Record after answering so diagnostics never delay a retransmit.
+			if ok, suppressed := ctrlLimiter.allow(receivedAt); ok {
+				rec := audioCtrlPacketRecord(buf[:n], n == len(buf))
+				rec["from"] = diagAddr(addr)
+				rec["from_receiver"] = fromReceiver
+				rec["rx_total"] = ctrlRxTotal
+				rec["suppressed_n"] = suppressed
+				rec["handle_us"] = micros(time.Since(receivedAt))
+				if !lastCtrlRx.IsZero() {
+					rec["since_prev_ms"] = receivedAt.Sub(lastCtrlRx).Milliseconds()
+				}
+				if handled {
+					rec["resent"] = resent
+					rec["expired"] = audioStream.retransmitExpired.Load() - expiredBefore
+					if req, ok := parseAudioRetransmitRequest(buf[:n]); ok {
+						rec["behind_last_sent"] = int64(int16(uint16(wire.lastSeq.Load()) - req.firstSeq))
+					}
+				}
+				if handleErr != nil {
+					rec["error"] = handleErr.Error()
+				}
+				diagEmit("audio.ctrl_rx", rec)
+			}
+			lastCtrlRx = receivedAt
+			if !fromReceiver {
 				dbg("[AUDIO] ignoring control packet from unexpected peer %s", addr)
 				continue
 			}
-			handled, _, handleErr := audioStream.handleAudioControlPacket(buf[:n], addr)
 			if handleErr != nil {
 				dbg("[AUDIO] retransmit response error for %s: %v", addr, handleErr)
 				continue
@@ -1260,7 +1423,16 @@ videoReady:
 		if err := burstLimiter.wait(ctx); err != nil {
 			return 0, err
 		}
-		return audioStream.sendAudioPacketWithSeqAndNonce(payload, rtpTime, seq, reuseNonce)
+		started := time.Now()
+		nonce, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, rtpTime, seq, reuseNonce)
+		took := time.Since(started)
+		if took > audioSlowSend {
+			diagEmit("audio.send_slow", map[string]any{"took_us": micros(took), "seq": seq, "rtp": rtpTime,
+				"wsaenobufs_retries_total": audioSendRetries.Load()})
+		}
+		diag.onSendTiming(took)
+		wire.onPacket(started, took, audioStream.wirePacketLen(len(payload)), reuseNonce != nil, err)
+		return nonce, err
 	}
 
 	const retransmitDepth = 8
@@ -1280,6 +1452,40 @@ videoReady:
 	framePTS := firstFramePosition.PTS
 	frameRTP := firstFrameRTP
 	staleFrames := 0
+	var staleRunStart time.Time
+	var stalePeakAge time.Duration
+	// Structured diagnostics (see audio_diag.go) stay available in tray sessions
+	// without verbose protocol logging, which can expose media or key material.
+	// Health comes from its own ticker so a stalled loop is still reported.
+	_, spfInfo, _, _, _, _ := AudioCodec(audioStream.ct).Info()
+	diagEmit("audio.start", map[string]any{
+		"timestamped": timestampedAudio, "codec_ct": audioStream.ct, "spf": spfInfo,
+		"latency_budget_us": micros(audioLatencyDuration(audioStream.latencySamples)),
+		"stale_threshold_age_us": micros(audioLatencyDuration(audioStream.latencySamples) - minimumAudioSendLead),
+		"initial_source_age_us": micros(time.Since(firstFramePosition.PTS)),
+		"chacha": audioStream.chachaCipher != nil, "fec": useFEC,
+		"timing_protocol": s.timingProtocol, "drift_max_slew_ppm": audioDriftMaxSlew * 1e6,
+	})
+	emitAudioSocket(audioStream, s.timingProtocol, useFEC)
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		wire.run(ctx, audioStream)
+	}()
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(audioHealthInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				diag.emitHealth(now, audioStream, capture, s.mediaClock)
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -1293,6 +1499,7 @@ videoReady:
 		if usingFirstFrame {
 			useFirstFrame = false
 		} else {
+			readStarted := time.Now()
 			n, framePosition, err = capture.readFramePosition(frameBuf)
 			if err != nil {
 				if ctx.Err() != nil {
@@ -1300,6 +1507,7 @@ videoReady:
 				}
 				return fmt.Errorf("audio read frame: %w", err)
 			}
+			diag.onRead(time.Since(readStarted))
 			framePTS = framePosition.PTS
 		}
 		if n == 0 {
@@ -1311,8 +1519,25 @@ videoReady:
 			framePTS = firstFramePosition.PTS.Add(audioSamplesDuration(uint64(frameCount) * uint64(spf)))
 			framePosition.PTS = framePTS
 		}
+		now := time.Now()
+		if timestampedAudio {
+			diag.onFrame(now, framePosition)
+		}
 		if !usingFirstFrame && timestampedAudio && audioFrameIsStale(framePTS, time.Now(), audioStream.latencySamples) {
 			staleFrames++
+			diag.onStale()
+			age := now.Sub(framePTS)
+			if staleFrames == 1 {
+				staleRunStart, stalePeakAge = now, age
+				diagEmit("audio.stale_start", map[string]any{
+					"source_age_us": micros(age), "latency_budget_us": micros(audioLatencyDuration(audioStream.latencySamples)),
+					"clock_correction_us": micros(framePosition.ClockCorrection),
+					"cause_hint":          "source PTS is later than the playout budget; if age is stable this is clock offset, not a capture backlog",
+				})
+			}
+			if age > stalePeakAge {
+				stalePeakAge = age
+			}
 			if staleFrames == 1 || staleFrames%100 == 0 {
 				dbg("[AUDIO] dropping stale source frame %v old (latency=%v, dropped=%d)",
 					time.Since(framePTS), audioLatencyDuration(audioStream.latencySamples), staleFrames)
@@ -1321,6 +1546,10 @@ videoReady:
 		}
 		if staleFrames > 0 {
 			dbg("[AUDIO] source caught up after dropping %d stale frames", staleFrames)
+			diagEmit("audio.stale_end", map[string]any{
+				"frames_dropped": staleFrames, "audio_dropped_ms": audioSamplesDuration(uint64(staleFrames) * uint64(spf)).Milliseconds(),
+				"run_ms": now.Sub(staleRunStart).Milliseconds(), "peak_source_age_us": micros(stalePeakAge),
+			})
 			staleFrames = 0
 		}
 		if frameCount > 0 {
@@ -1330,11 +1559,15 @@ videoReady:
 				frameRTP, reset = rtpClock.mapFramePosition(framePosition, spf)
 				if reset {
 					clockNow, timelineID := s.audioClockAt(framePTS)
-					err := audioStream.sendSyncPacketAt(s.timingProtocol, clockNow, timelineID, frameRTP, true)
+					announce, err := audioStream.sendSyncPacketDiag(s.timingProtocol, clockNow, timelineID, frameRTP, true, framePTS)
 					announceMu.Unlock()
+					announce.emit()
 					if err != nil {
 						return fmt.Errorf("audio reset clock mapping: %w", err)
 					}
+					diag.onClockReset()
+					diagEmit("audio.clock_reset", map[string]any{"rtp": frameRTP, "source_age_us": micros(now.Sub(framePTS)),
+						"clock_correction_us": micros(framePosition.ClockCorrection)})
 					dbg("[AUDIO] reset source clock mapping pts=%v rtp=%d", framePTS, frameRTP)
 				} else {
 					announceMu.Unlock()
@@ -1389,6 +1622,8 @@ videoReady:
 			s.firstAudioOnce.Do(func() { close(s.firstAudioSent) })
 		}
 
+		diag.onSent(frameRTP, frameSeq)
+		wire.onFresh(time.Now(), frameSeq, frameRTP, n)
 		frameSeq++
 
 		if frameCount <= 10 || frameCount%100 == 0 {

@@ -185,7 +185,11 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 			return ctx.Err()
 		default:
 		}
+		readStart := time.Now()
 		unit, err := capture.ReadVideoAccessUnit()
+		if len(unit.AnnexB) > 0 {
+			s.vdiag.onAccessUnit(readStart, time.Now(), unit.PTS, len(unit.AnnexB))
+		}
 		if err != nil {
 			if err == io.EOF && ctx.Err() != nil {
 				return ctx.Err()
@@ -225,6 +229,7 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 			continue
 		}
 		if !primed && (!keyframe || len(current[0]) == 0 || len(current[1]) == 0 || len(current[2]) == 0) {
+			s.vdiag.onUnprimed()
 			continue
 		}
 		timestamp, timeline, ok := s.frameTimeAt(unit.PTS)
@@ -243,6 +248,7 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 			if err := s.sendCodecFrame(config, timestamp, VideoCodecHEVC); err != nil {
 				return fmt.Errorf("send HEVC codec: %w", err)
 			}
+			s.vdiag.onCodecFrame(VideoCodecHEVC, s.videoWidth, s.videoHeight, len(config), time.Now())
 			for n := range current {
 				sent[n] = append(sent[n][:0], current[n]...)
 			}

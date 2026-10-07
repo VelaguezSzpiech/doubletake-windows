@@ -19,6 +19,7 @@ func writeAudioDatagram(conn net.PacketConn, packet []byte, addr net.Addr) (int,
 			return n, err
 		}
 		// No sleeping or extra allocation on the successful steady-state path.
+		audioSendRetries.Add(1)
 		time.Sleep(2 * time.Millisecond)
 	}
 }

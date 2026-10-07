@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -461,11 +462,11 @@ func TestMediaClockReanchorsWithoutChangingTimeline(t *testing.T) {
 	receivedAt := time.Unix(2, 0)
 	if err := clock.reanchor(map[string]string{
 		"x-apple-requestreceivedtimestamp": "2000",
-		"x-apple-processingtime":           "5",
+		"x-apple-processingtime":           "8", // above mediaClockStepThreshold: applied at once
 	}, receivedAt); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := clock.anchorTimestamp, compactTimestamp(2005*time.Millisecond); got != want {
+	if got, want := clock.anchorTimestamp, compactTimestamp(2008*time.Millisecond); got != want {
 		t.Fatalf("anchor timestamp = 0x%016x, want 0x%016x", got, want)
 	}
 	if !clock.anchorLocal.Equal(receivedAt) {
@@ -658,3 +659,44 @@ func TestSendNTPTimingProbesUsesReceiverPort(t *testing.T) {
 		}
 	}
 }
+
+func TestMediaClockReanchorSlewsSmallForwardPhaseButAppliesRealOffsets(t *testing.T) {
+	const timeline = uint64(0x48e15caa8da00008)
+	newClock := func() *mediaClock {
+		return &mediaClock{anchorLocal: time.Unix(10, 0), anchorTimestamp: compactTimestamp(10 * time.Second), timelineID: timeline}
+	}
+	feedback := func(clock *mediaClock, receiverMillis uint64) {
+		t.Helper()
+		if err := clock.reanchor(map[string]string{
+			"x-apple-requestreceivedtimestamp": strconvU(receiverMillis),
+			"x-apple-processingtime":           "0",
+		}, time.Unix(12, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projected := compactTimestamp(12 * time.Second)
+
+	// Receiver 2 ms ahead of the projection (quantization-scale): slewed, not stepped.
+	clock := newClock()
+	feedback(clock, 12002)
+	step := timeFromNTP(clock.anchorTimestamp).Sub(timeFromNTP(projected))
+	if want := time.Duration(float64(2*time.Second) * mediaClockMaxForwardSlew); step < want-time.Microsecond || step > want+time.Microsecond {
+		t.Fatalf("2ms forward phase moved the clock by %v, want the %v slew limit", step, want)
+	}
+
+	// Receiver behind the projection: never moves backwards.
+	clock = newClock()
+	feedback(clock, 11998)
+	if clock.anchorTimestamp != projected {
+		t.Fatalf("backward feedback changed the projection by %v", timeFromNTP(clock.anchorTimestamp).Sub(timeFromNTP(projected)))
+	}
+
+	// A real offset is applied at once so audio and video do not stay misaligned.
+	clock = newClock()
+	feedback(clock, 12040)
+	if got := timeFromNTP(clock.anchorTimestamp).Sub(timeFromNTP(projected)); got < 39*time.Millisecond || got > 41*time.Millisecond {
+		t.Fatalf("40ms offset applied as %v, want it applied immediately", got)
+	}
+}
+
+func strconvU(v uint64) string { return fmt.Sprintf("%d", v) }
